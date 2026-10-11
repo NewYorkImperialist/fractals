@@ -51,6 +51,7 @@ struct Viewport {
 
 const FLAG_JULIA: u32 = 1u;
 const FLAG_DOUBLE: u32 = 2u;
+const FLAG_OUTLINE: u32 = 4u;
 // Large bailout radius (|z| > 16) keeps smooth colouring band-free.
 const BAILOUT_SQ: f32 = 256.0;
 const TAU: f32 = 6.28318530718;
@@ -101,29 +102,48 @@ fn ds_sqr(a: vec2<f32>) -> vec2<f32> {
 }
 
 // ---------------------------------------------------------------------------
-// Escape-time iteration, z_next = z^2 + c. Returns (iterations, |z|^2).
+// Escape-time iteration, z_next = z^2 + c. Returns (iterations, |z|^2,
+// |dz|^2): with FLAG_OUTLINE the derivative dz is tracked alongside z
+// (Julia: dz_next = 2 z dz, dz_0 = 1; Mandelbrot: dz_next = 2 z dz + 1,
+// dz_0 = 0) for the distance estimate. Only its magnitude matters, so f32 is
+// enough even on the double-single path.
 // ---------------------------------------------------------------------------
 
-fn escape_single(z0: vec2<f32>, c: vec2<f32>) -> vec2<f32> {
+fn derivative_step(z: vec2<f32>, dz: vec2<f32>, dc: f32) -> vec2<f32> {
+  return 2.0 * vec2<f32>(z.x * dz.x - z.y * dz.y, z.x * dz.y + z.y * dz.x) +
+         vec2<f32>(dc, 0.0);
+}
+
+fn escape_single(z0: vec2<f32>, c: vec2<f32>, dz0: vec2<f32>, dc: f32) -> vec3<f32> {
+  let outline = (view.flags & FLAG_OUTLINE) != 0u;
   var z = z0;
+  var dz = dz0;
   var r2 = dot(z, z);
   var i = 0u;
   while (i < view.iteration_limit && r2 <= BAILOUT_SQ) {
+    if (outline) {
+      dz = derivative_step(z, dz, dc);
+    }
     z = vec2<f32>(z.x * z.x - z.y * z.y, 2.0 * z.x * z.y) + c;
     r2 = dot(z, z);
     i += 1u;
   }
-  return vec2<f32>(f32(i), r2);
+  return vec3<f32>(f32(i), r2, dot(dz, dz));
 }
 
-fn escape_double(z0x: vec2<f32>, z0y: vec2<f32>,
-                 cx: vec2<f32>, cy: vec2<f32>) -> vec2<f32> {
+fn escape_double(z0x: vec2<f32>, z0y: vec2<f32>, cx: vec2<f32>, cy: vec2<f32>,
+                 dz0: vec2<f32>, dc: f32) -> vec3<f32> {
+  let outline = (view.flags & FLAG_OUTLINE) != 0u;
   var zx = z0x;
   var zy = z0y;
+  var dz = dz0;
   var x2 = ds_sqr(zx);
   var y2 = ds_sqr(zy);
   var i = 0u;
   while (i < view.iteration_limit && x2.x + y2.x <= BAILOUT_SQ) {
+    if (outline) {
+      dz = derivative_step(vec2<f32>(zx.x, zy.x), dz, dc);
+    }
     let xy = ds_mul(zx, zy);
     zy = ds_add(2.0 * xy, cy);  // scaling by 2 is exact
     zx = ds_add(ds_add(x2, -y2), cx);
@@ -131,7 +151,7 @@ fn escape_double(z0x: vec2<f32>, z0y: vec2<f32>,
     y2 = ds_sqr(zy);
     i += 1u;
   }
-  return vec2<f32>(f32(i), x2.x + y2.x);
+  return vec3<f32>(f32(i), x2.x + y2.x, dot(dz, dz));
 }
 
 // Main cardioid and period-2 bulb never escape: skip straight to the limit.
@@ -142,14 +162,24 @@ fn in_mandelbrot_interior(c: vec2<f32>) -> bool {
   return q * (q + x) <= 0.25 * c.y * c.y || bulb <= 0.0625;
 }
 
-fn shade(result: vec2<f32>) -> vec3<f32> {
+fn shade(result: vec3<f32>) -> vec3<f32> {
   if (u32(result.x) >= view.iteration_limit) {
     return vec3<f32>(0.0);
   }
   // Normalised iteration count: continuous across escape bands.
   let mu = max(result.x + 1.0 - log2(0.5 * log(result.y)), 0.0);
   let t = sqrt(mu) * 0.12 + view.color_phase;
-  return 0.5 + 0.5 * cos(TAU * (t + vec3<f32>(0.0, 0.10, 0.20)));
+  let glow = 0.5 + 0.5 * cos(TAU * (t + vec3<f32>(0.0, 0.10, 0.20)));
+  if ((view.flags & FLAG_OUTLINE) == 0u) {
+    return glow;
+  }
+  // Distance estimate |z| ln|z| / |dz| to the set itself, in pixels. Points
+  // of the set (including Cantor dust, which has no interior) light up.
+  let distance = 0.5 * sqrt(result.y / result.z) * log(result.y);
+  let pixel = (view.y_max - view.y_min) / (f32(view.height) * view.zoom);
+  // ~2-3 px wide so sub-pixel dust stays visible on high-DPI screens.
+  let on_set = 1.0 - smoothstep(1.0, 3.0, distance / pixel);
+  return mix(glow * 0.25, vec3<f32>(1.0), on_set);
 }
 
 @compute @workgroup_size({{workgroupSize}})
@@ -170,22 +200,25 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let jx = vec2<f32>(view.julia_x_hi, view.julia_x_lo);
   let jy = vec2<f32>(view.julia_y_hi, view.julia_y_lo);
   let julia = (view.flags & FLAG_JULIA) != 0u;
+  // Derivative seeds: d/dz for Julia, d/dc for Mandelbrot.
+  let dz0 = select(vec2<f32>(0.0), vec2<f32>(1.0, 0.0), julia);
+  let dc = select(1.0, 0.0, julia);
 
-  var result: vec2<f32>;
+  var result: vec3<f32>;
   if (!julia && in_mandelbrot_interior(vec2<f32>(px.x, py.x))) {
-    result = vec2<f32>(f32(view.iteration_limit), 0.0);
+    result = vec3<f32>(f32(view.iteration_limit), 0.0, 0.0);
   } else if ((view.flags & FLAG_DOUBLE) != 0u) {
     if (julia) {
-      result = escape_double(px, py, jx, jy);
+      result = escape_double(px, py, jx, jy, dz0, dc);
     } else {
-      result = escape_double(vec2<f32>(0.0), vec2<f32>(0.0), px, py);
+      result = escape_double(vec2<f32>(0.0), vec2<f32>(0.0), px, py, dz0, dc);
     }
   } else {
     let p = vec2<f32>(px.x, py.x);
     if (julia) {
-      result = escape_single(p, vec2<f32>(jx.x, jy.x));
+      result = escape_single(p, vec2<f32>(jx.x, jy.x), dz0, dc);
     } else {
-      result = escape_single(vec2<f32>(0.0), p);
+      result = escape_single(vec2<f32>(0.0), p, dz0, dc);
     }
   }
 

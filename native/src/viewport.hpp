@@ -22,6 +22,7 @@ static_assert(sizeof(ViewportUniform) == 80, "must match WGSL Viewport");
 
 inline constexpr uint32_t kFlagJulia = 1u;
 inline constexpr uint32_t kFlagDouble = 2u;
+inline constexpr uint32_t kFlagOutline = 4u;
 
 // Split a double into an unevaluated float sum hi + lo (~48-bit mantissa).
 struct DoubleSingle {
@@ -59,6 +60,14 @@ struct Camera {
     const double u = px / width, v = py / height;
     re = center_x + (e.x_min + (e.x_max - e.x_min) * u) / zoom;
     im = center_y + (e.y_max + (e.y_min - e.y_max) * v) / zoom;
+  }
+
+  // Inverse of to_complex: where a complex coordinate lands on screen.
+  void to_pixel(double re, double im, uint32_t width, uint32_t height,
+                double &px, double &py) const {
+    const Extent e = extent(width, height);
+    px = ((re - center_x) * zoom - e.x_min) / (e.x_max - e.x_min) * width;
+    py = ((im - center_y) * zoom - e.y_max) / (e.y_min - e.y_max) * height;
   }
 
   // Zoom by `factor`, keeping the point under the cursor fixed on screen.
