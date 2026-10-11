@@ -4,6 +4,7 @@
 #   make dawn    build + stage Dawn for gpu.cpp (needs cmake, ninja, several GB of disk)
 #   make         build ./fractal_explorer
 #   make run
+#   make bench   headless benchmark / reference renderer (tools/bench.cpp)
 
 GPUCPP     := third_party/gpu.cpp
 GPUCPP_REV := 09bdeaa7a0c6715ed7624ee90eda53aa2d8c4cbc
@@ -31,7 +32,11 @@ dawn: $(GPUCPP)
 run: fractal_explorer
 	./fractal_explorer
 
+bench: tools/bench.cpp src/fractal_shader.hpp src/viewport.hpp
+	$(CXX) $(CXXFLAGS) $< -o $@ -L$(DAWN)/lib -lwebgpu_dawn \
+	  -Wl,-rpath,$(abspath $(DAWN)/lib) -lz
+
 clean:
-	rm -f fractal_explorer
+	rm -f fractal_explorer bench
 
 .PHONY: deps dawn run clean
