@@ -18,7 +18,7 @@
 //
 // Entry points: `main` computes every pixel of a tile; `ring_main`,
 // `cross_main` and `fill_main` compute a tile with interior block filling
-// (see the comment above ring_main). FractalKernel picks them.
+// (see "Interior block filling" below). FractalKernel picks them.
 //
 // Two ways to iterate a pixel:
 //

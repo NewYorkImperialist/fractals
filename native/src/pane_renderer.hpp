@@ -176,7 +176,7 @@ inline gpu::Future submit(gpu::Context &context, const wgpu::CommandBuffer &comm
 //     only levels known to be complete (below the tile's level_lo) or
 //     computed by the tile itself; where that cannot vouch for a pixel it
 //     computes it, so filled and computed images differ at most where a
-//     sub-pixel filament slips through a ring (see fill_main).
+//     sub-pixel filament slips through a ring (see fractal_shader.hpp).
 //   * Several encode()s per frame share one submission; tile parameters go
 //     through a dynamic-offset uniform ring so each dispatch sees its own.
 // ---------------------------------------------------------------------------
@@ -230,7 +230,7 @@ public:
     next_slot_ = 0;
   }
 
-  // Interior block filling (see ring_main in the shader) for tiles that
+  // Interior block filling (see fractal_shader.hpp) for tiles that
   // reach level 1 or 2; off: every pixel is computed.
   bool block_fill = true;
 
@@ -256,7 +256,7 @@ public:
     }
     // The three fill passes over the lattice of levels <= level_hi (stride
     // 2 or 1), in blocks of 18 x 18 points, one around the tile's as a
-    // guard band (block_range mirrors first_block / block_count in the
+    // guard band (block_count mirrors first_block / block_count in the
     // shader). Each pass sees the previous ones' writes (separate
     // dispatches of a pass are ordered).
     const auto [blocks_x, blocks_y] = block_count(tile);
