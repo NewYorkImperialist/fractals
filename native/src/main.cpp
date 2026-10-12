@@ -13,8 +13,14 @@
 //     -Wl,-rpath,third_party/gpu.cpp/third_party/dawn/lib \
 //     $(sdl2-config --libs)
 //
-// g++ works the same way (g++ 11+ for C++20). Do NOT add -ffast-math: the
-// double -> (hi, lo) split relies on strict IEEE rounding.
+// plus MPFR / GMP (-lmpfr -lgmp; see the Makefile). g++ works the same way
+// (g++ 11+ for C++20). Do NOT add -ffast-math: the double -> (hi, lo) split
+// and the CPU-side FloatExp and BLA arithmetic rely on IEEE rounding and
+// infinities.
+//
+// Deep zooms use perturbation against an arbitrary-precision reference orbit
+// (perturbation.hpp), computed on a background thread; until a view's first
+// usable reference is ready its pane keeps showing the previous image.
 //
 // Rendering is incremental (see pane_renderer.hpp): pans shift the last image
 // and compute only the exposed strips, slow views refine coarse to fine in
@@ -31,7 +37,7 @@
 //   Right drag        move the Julia point even while locked
 //   Tab               split view <-> single view of the pane under the cursor
 //   J                 single view: Julia for the point under cursor (again: back)
-//   + / -             iteration limit          P    precision: auto/f32/double-single
+//   + / -             iteration limit          P    precision: auto/f32/perturbation
 //   D                 outline: draw the set itself (e.g. Julia Cantor dust)
 //   K                 jump to a Cantor-set Julia (c = -2.5: dust on a line)
 //   H                 toggle half-res render   C    animate palette
@@ -58,7 +64,9 @@
 
 #include "gpu.hpp"
 
+#include "bigfloat.hpp"
 #include "pane_renderer.hpp"
+#include "perturbation.hpp"
 #include "viewport.hpp"
 
 namespace {
@@ -67,7 +75,7 @@ namespace {
 // Explorer state: cameras, layout and render settings.
 // ---------------------------------------------------------------------------
 
-enum class Precision { Auto, Single, DoubleSingle };
+enum class Precision { Auto, Single, Perturbation };
 enum class Fractal { Mandelbrot, Julia };
 
 struct Explorer {
@@ -76,7 +84,7 @@ struct Explorer {
   bool split = true;
   bool follow_mouse = true; // split view: Julia point tracks the cursor
   Fractal single = Fractal::Mandelbrot; // single view: what fills the window
-  double julia_re = -0.8, julia_im = 0.156;
+  BigFloat julia_re = -0.8, julia_im = 0.156;
   uint32_t iterations = 512;
   Precision precision = Precision::Auto;
   bool animate_colors = false;
@@ -86,8 +94,8 @@ struct Explorer {
 
   static Camera initial(Fractal fractal) {
     switch (fractal) {
-    case Fractal::Mandelbrot: return Camera{.center_x = -0.5};
-    case Fractal::Julia: return Camera{};
+    case Fractal::Mandelbrot: return Camera::at(-0.5, 0.0, 1.0);
+    case Fractal::Julia: return Camera::at(0.0, 0.0, 1.0);
     }
     return Camera{};
   }
@@ -99,44 +107,16 @@ struct Explorer {
     return fractal == Fractal::Julia ? julia : mandelbrot;
   }
 
-  bool uses_double(Fractal fractal, uint32_t height) const {
-    if (precision != Precision::Auto) return precision == Precision::DoubleSingle;
-    // Switch once a pixel shrinks to a few f32 ulps of the coordinates.
-    const Camera &cam = camera(fractal);
-    const double magnitude =
-        std::max({std::abs(cam.center_x), std::abs(cam.center_y), 1.0});
-    return cam.pixel_size(height) < magnitude * 4e-6;
+  bool uses_perturbation(Fractal fractal, uint32_t height) const {
+    if (precision != Precision::Auto) return precision == Precision::Perturbation;
+    return perturbation::needed(camera(fractal), height);
   }
 
-  // Uniform for the view's pixel grid (Camera::grid): view pixel (px, py) is
-  // grid pixel (px + origin_x, py + origin_y).
-  ViewportUniform uniform(Fractal fractal, uint32_t width, uint32_t height,
-                          float phase) const {
-    const Camera &cam = camera(fractal);
-    const Camera::Extent e = Camera::extent(width, height);
-    const Camera::Grid grid = cam.grid(height);
-    const DoubleSingle ox(grid.x), oy(grid.y);
-    // The Mandelbrot image does not depend on the Julia point; leaving it out
-    // keeps that image valid while the point moves.
-    const bool julia = fractal == Fractal::Julia;
-    const DoubleSingle jx(julia ? julia_re : 0.0), jy(julia ? julia_im : 0.0);
-    uint32_t flags = 0;
-    if (fractal == Fractal::Julia) flags |= kFlagJulia;
-    if (uses_double(fractal, height)) flags |= kFlagDouble;
-    if (outline) flags |= kFlagOutline;
-    return ViewportUniform{
-        .x_min = float(e.x_min), .x_max = float(e.x_max),
-        .y_min = float(e.y_min), .y_max = float(e.y_max),
-        .zoom = float(cam.zoom),
-        .iteration_limit = iterations,
-        .width = width, .height = height,
-        .offset_x_hi = ox.hi, .offset_x_lo = ox.lo,
-        .offset_y_hi = oy.hi, .offset_y_lo = oy.lo,
-        .julia_x_hi = jx.hi, .julia_x_lo = jx.lo,
-        .julia_y_hi = jy.hi, .julia_y_lo = jy.lo,
-        .flags = flags,
-        .color_phase = phase,
-    };
+  // The view on the camera's pixel grid (Camera::grid): view pixel (px, py)
+  // is grid pixel (px + origin_x, py + origin_y).
+  perturbation::View view(Fractal fractal, uint32_t width, uint32_t height) const {
+    return perturbation::make_view(camera(fractal), fractal == Fractal::Julia, julia_re,
+                                   julia_im, iterations, width, height);
   }
 };
 
@@ -298,6 +278,8 @@ struct Pane {
   SDL_Rect rect{};             // in output pixels
   uint32_t width = 0, height = 0; // render resolution (rect / divisor)
   PaneRenderer renderer;
+  perturbation::ReferenceCache reference;
+  uint32_t reference_id = 0;   // reference of the last perturbation request
   float color_phase = 0.0f;    // phase this pane renders with (see frame())
   double budget = 0.0;         // pixels it may compute this frame
   double encoded = 0.0;        // pixels in the frame in flight
@@ -336,8 +318,9 @@ public:
         if (SDL_WaitEventTimeout(&event, 1)) handle(event);
       } else if (idle) {
         // Not SDL_WaitEvent: SDL only turns SIGINT/SIGTERM into SDL_QUIT
-        // when it pumps events, so wake up a few times a second.
-        if (SDL_WaitEventTimeout(&event, 250)) handle(event);
+        // when it pumps events, so wake up a few times a second -- or
+        // often while a reference orbit is computed in the background.
+        if (SDL_WaitEventTimeout(&event, references_busy() ? 4 : 250)) handle(event);
       }
       while (SDL_PollEvent(&event)) handle(event);
 
@@ -385,16 +368,43 @@ private:
     return true;
   }
 
-  PaneRenderer::Request request(const Pane &pane) const {
-    const Camera &cam = state_.camera(pane.kind);
-    const Camera::Grid grid = cam.grid(pane.height);
-    return PaneRenderer::Request{
-        .uniform = state_.uniform(pane.kind, pane.width, pane.height, pane.color_phase),
+  bool references_busy() const {
+    for (const Pane &p : panes_)
+      if (p.visible && p.reference.busy()) return true;
+    return false;
+  }
+
+  // Hands the pane's renderer its current view. Perturbation views use the
+  // pane's cached reference (perhaps stale, but still correct: it is
+  // replaced in the background); while no usable one exists the renderer
+  // waits, keeping the previous image on screen.
+  void request(Pane &pane, Clock::time_point now) {
+    perturbation::View view = state_.view(pane.kind, pane.width, pane.height);
+    std::shared_ptr<const perturbation::Reference> reference;
+    const bool perturb = state_.uses_perturbation(pane.kind, pane.height);
+    if (perturb) {
+      reference = pane.reference.get(view);
+      if (reference && reference->id != pane.reference_id) {
+        // A new reference starts a new image anyway: move the grid anchor to
+        // the view centre so pixel offsets from it stay small.
+        pane.reference_id = reference->id;
+        Camera &cam = state_.camera(pane.kind);
+        if (cam.pan_x || cam.pan_y) {
+          cam.fold_pan();
+          view = state_.view(pane.kind, pane.width, pane.height);
+        }
+      }
+    }
+    PaneRenderer::Request r{
+        .uniform = make_uniform(view, reference.get(), state_.outline, pane.color_phase),
+        .reference = reference,
         .width = pane.width, .height = pane.height,
-        .origin_x = grid.origin_x, .origin_y = grid.origin_y,
-        .center_x = cam.view_x(), .center_y = cam.view_y(),
-        .pixel_size = cam.pixel_size(pane.height),
+        .origin_x = view.grid.origin_x, .origin_y = view.grid.origin_y,
+        .center_x = view.camera.center_x, .center_y = view.camera.center_y,
+        .log2_pixel_size = view.camera.log2_pixel_size(pane.height),
     };
+    if (perturb && !reference) pane.renderer.wait_for(r, now);
+    else pane.renderer.request(r, now);
   }
 
   // Plans, encodes and presents one frame if anything changed. Compute for
@@ -416,7 +426,7 @@ private:
       // A new palette phase is picked up once the pane has caught up, so
       // animation never restarts a slow render that is still refining.
       if (!pane.renderer.busy()) pane.color_phase = state_.color_phase;
-      pane.renderer.request(request(pane), now);
+      request(pane, now);
       active.push_back(&pane);
     }
 
@@ -642,8 +652,8 @@ private:
   void show_cantor_julia() {
     constexpr double kC = -2.5;
     const double beta = (1.0 + std::sqrt(1.0 - 4.0 * kC)) / 2.0;
-    state_.julia_re = kC;
-    state_.julia_im = 0.0;
+    state_.julia_re = BigFloat(kC);
+    state_.julia_im = BigFloat(0.0);
     state_.follow_mouse = false;
     state_.outline = true;
     picking_ = false;
@@ -653,17 +663,16 @@ private:
     // Frame [-beta, beta] with a 10% margin on each side.
     const Pane &j = julia_pane();
     const double aspect = double(j.width) / j.height;
-    state_.julia = Camera{
-        .zoom = 2.0 * Camera::kHalfHeight * aspect / (2.4 * beta)};
+    state_.julia = Camera::at(0.0, 0.0, 2.0 * Camera::kHalfHeight * aspect / (2.4 * beta));
 
     // Make sure the crosshair at c is on screen in the Mandelbrot pane.
     Pane &m = mandelbrot_pane();
     double px, py;
-    state_.mandelbrot.to_pixel(kC, 0.0, m.width, m.height, px, py);
+    state_.mandelbrot.to_pixel(state_.julia_re, state_.julia_im, m.width, m.height, px, py);
     if (px < 0 || px >= m.width || py < 0 || py >= m.height) {
       const double m_aspect = double(m.width) / m.height;
-      state_.mandelbrot = Camera{
-          .center_x = -1.0, .zoom = 2.0 * Camera::kHalfHeight * m_aspect / 3.8};
+      state_.mandelbrot =
+          Camera::at(-1.0, 0.0, 2.0 * Camera::kHalfHeight * m_aspect / 3.8);
     }
   }
 
@@ -707,9 +716,19 @@ private:
   // While drawing: GPU time of the last frame and frames per second; when
   // idle the last frame's time.
   void update_title(bool idle) {
-    static constexpr const char *kPrecisionNames[] = {"auto", "f32", "double-single"};
-    auto precision = [&](Fractal kind) {
-      return state_.uses_double(kind, pane(kind).height) ? "ds" : "f32";
+    static constexpr const char *kPrecisionNames[] = {"auto", "f32", "perturbation"};
+    auto precision = [&](Fractal kind) -> std::string {
+      if (!state_.uses_perturbation(kind, pane(kind).height)) return "f32";
+      std::string name = state_.camera(kind).log2_zoom > perturbation::kFloatExpLog2Zoom
+                             ? "perturb-fx" : "perturb";
+      return pane(kind).reference.busy() ? name + " (ref...)" : name;
+    };
+    // %g, or a power of ten once the zoom leaves double range.
+    auto zoom = [](const Camera &cam) {
+      char text[32];
+      if (cam.log2_zoom < 1000) std::snprintf(text, sizeof(text), "%.3g", cam.zoom());
+      else std::snprintf(text, sizeof(text), "1e%.1f", cam.log2_zoom * std::log10(2.0));
+      return std::string(text);
     };
     char buffer[128];
     std::string title;
@@ -726,11 +745,12 @@ private:
     frames_ = 0;
     last_title_ = now;
     if (mandelbrot_pane().visible)
-      append(" | Mandelbrot %.3gx %s", state_.mandelbrot.zoom,
-             precision(Fractal::Mandelbrot));
+      append(" | Mandelbrot %sx %s", zoom(state_.mandelbrot).c_str(),
+             precision(Fractal::Mandelbrot).c_str());
     if (julia_pane().visible)
-      append(" | Julia c = %.6f %+.6fi  %.3gx %s", state_.julia_re,
-             state_.julia_im, state_.julia.zoom, precision(Fractal::Julia));
+      append(" | Julia c = %.6f %+.6fi  %sx %s", state_.julia_re.to_double(),
+             state_.julia_im.to_double(), zoom(state_.julia).c_str(),
+             precision(Fractal::Julia).c_str());
     if (state_.split) append("%s", state_.follow_mouse ? " (follows mouse)" : " (locked)");
 
     append(" | %u iter | precision %s%s%s", state_.iterations,

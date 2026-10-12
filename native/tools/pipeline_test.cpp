@@ -9,7 +9,11 @@
 // renderer bench.cpp uses (itself bit-identical to the pre-pipeline kernel):
 //   * progressive refinement under tiny budgets (many tiles, coarse to fine),
 //   * pan reuse: shift + strips, also mid-refinement and chained pans,
-//   * the compositor: presented pixels equal the image (1x and half-res).
+//   * the compositor: presented pixels equal the image (1x and half-res),
+//   * waiting for a reference orbit: nothing is computed, the old image
+//     stays shown, and the view then renders as usual.
+// Perturbation views (to 1e100) run the same checks with one reference
+// orbit computed up front, as the app's ReferenceCache would provide it.
 // Exit status is non-zero if any comparison differs.
 
 #include <algorithm>
@@ -23,6 +27,7 @@
 #include "gpu.hpp"
 
 #include "../src/pane_renderer.hpp"
+#include "../src/perturbation.hpp"
 #include "../src/viewport.hpp"
 
 namespace {
@@ -33,45 +38,57 @@ double elapsed_ms(Clock::time_point start) {
   return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
 }
 
+// flags: kFlagJulia, kFlagOutline; kFlagPerturb renders with a reference
+// orbit computed at the initial view (see with_reference).
 struct View {
   Camera camera;
   uint32_t iterations = 512;
   uint32_t flags = 0;
-  double julia_re = 0.0, julia_im = 0.0;
+  BigFloat julia_re = 0.0, julia_im = 0.0;
+  std::shared_ptr<const perturbation::Reference> reference = nullptr;
 };
 
-constexpr double kDeepX = -0.743643887037158704752191506114774;
-constexpr double kDeepY = 0.131825904205311970493132056385139;
+constexpr const char *kDeepX = "-0.743643887037158704752191506114774";
+constexpr const char *kDeepY = "0.131825904205311970493132056385139";
+// Misiurewicz point M(4,1) (see bench.cpp), to 120 digits.
+constexpr const char *kMisiurewiczX =
+    "-0.10109636384562216102578544573862256546380544282625348387693117766078084074047058427482"
+    "1219810516779033404531908556741";
+constexpr const char *kMisiurewiczY =
+    "0.956286510809141500771096057729977435809833336510529170034314321500524659065716732526978"
+    "4107873398072043444724926469284";
 
-// Same construction as Explorer::uniform in main.cpp.
-ViewportUniform uniform_for(const View &v, uint32_t width, uint32_t height) {
-  const Camera::Extent e = Camera::extent(width, height);
-  const Camera::Grid grid = v.camera.grid(height);
-  const DoubleSingle ox(grid.x), oy(grid.y);
-  const DoubleSingle jx(v.julia_re), jy(v.julia_im);
-  return ViewportUniform{
-      .x_min = float(e.x_min), .x_max = float(e.x_max),
-      .y_min = float(e.y_min), .y_max = float(e.y_max),
-      .zoom = float(v.camera.zoom),
-      .iteration_limit = v.iterations,
-      .width = width, .height = height,
-      .offset_x_hi = ox.hi, .offset_x_lo = ox.lo,
-      .offset_y_hi = oy.hi, .offset_y_lo = oy.lo,
-      .julia_x_hi = jx.hi, .julia_x_lo = jx.lo,
-      .julia_y_hi = jy.hi, .julia_y_lo = jy.lo,
-      .flags = v.flags,
-      .color_phase = 0.0f,
-  };
+Camera deep_camera(const char *x, const char *y, double log10_zoom) {
+  const double log2_zoom = log10_zoom * std::log2(10.0);
+  const long bits = Camera::bits_for(log2_zoom);
+  Camera camera{.center_x = BigFloat(x, bits), .center_y = BigFloat(y, bits),
+                .log2_zoom = log2_zoom};
+  camera.update_precision();
+  return camera;
 }
 
+perturbation::View pview(const View &v, uint32_t width, uint32_t height) {
+  return perturbation::make_view(v.camera, (v.flags & kFlagJulia) != 0, v.julia_re,
+                                 v.julia_im, v.iterations, width, height);
+}
+
+// Computes the reference orbit the app would use for the view as it is now.
+View with_reference(View v, uint32_t width, uint32_t height) {
+  if (v.flags & kFlagPerturb)
+    v.reference = perturbation::compute_reference(perturbation::key_for(pview(v, width, height)));
+  return v;
+}
+
+// Same construction as App::request in main.cpp.
 PaneRenderer::Request request_for(const View &v, uint32_t width, uint32_t height) {
-  const Camera::Grid grid = v.camera.grid(height);
+  const perturbation::View view = pview(v, width, height);
   return PaneRenderer::Request{
-      .uniform = uniform_for(v, width, height),
+      .uniform = make_uniform(view, v.reference.get(), (v.flags & kFlagOutline) != 0, 0.0f),
+      .reference = v.reference,
       .width = width, .height = height,
-      .origin_x = grid.origin_x, .origin_y = grid.origin_y,
-      .center_x = v.camera.view_x(), .center_y = v.camera.view_y(),
-      .pixel_size = v.camera.pixel_size(height),
+      .origin_x = view.grid.origin_x, .origin_y = view.grid.origin_y,
+      .center_x = view.camera.center_x, .center_y = view.camera.center_y,
+      .log2_pixel_size = view.camera.log2_pixel_size(height),
   };
 }
 
@@ -97,7 +114,7 @@ public:
       scratch_ = gpu::createTensor(context_, gpu::Shape{size_t(r.width) * r.height}, gpu::kf32);
     auto encoder = context_.device.CreateCommandEncoder();
     auto pass = encoder.BeginComputePass();
-    kernel_.begin(r.uniform);
+    kernel_.begin(r.uniform, r.reference);
     kernel_.encode(pass, scratch_,
                    FractalKernel::Tile{.origin_x = r.origin_x, .origin_y = r.origin_y,
                                        .rect = {0, 0, int32_t(r.width), int32_t(r.height)}});
@@ -232,19 +249,32 @@ int main(int argc, char **argv) {
   Harness harness(context);
 
   const Case cases[] = {
-      {"home", View{.camera = {.center_x = -0.5}}, 1440, 1650},
-      {"seahorse", View{.camera = {.center_x = -0.7453, .center_y = 0.1127, .zoom = 1e3},
-                        .iterations = 1000}, 720, 825},
-      {"julia_outline", View{.camera = {.zoom = 1.3}, .flags = kFlagJulia | kFlagOutline,
+      {"home", View{.camera = Camera::at(-0.5, 0.0, 1.0)}, 1440, 1650},
+      {"seahorse", View{.camera = Camera::at(-0.7453, 0.1127, 1e3), .iterations = 1000},
+       720, 825},
+      {"julia_outline", View{.camera = Camera::at(0.0, 0.0, 1.3),
+                             .flags = kFlagJulia | kFlagOutline,
                              .julia_re = -0.8, .julia_im = 0.156}, 701, 533},
-      {"deep_1e9_ds", View{.camera = {.center_x = kDeepX, .center_y = kDeepY, .zoom = 1e9},
-                           .iterations = 4000, .flags = kFlagDouble}, 360, 413},
+      {"deep_1e9_perturb", View{.camera = deep_camera(kDeepX, kDeepY, 9.0),
+                                .iterations = 4000, .flags = kFlagPerturb}, 360, 413},
+      {"deep_1e20_perturb_bla", View{.camera = deep_camera(kDeepX, kDeepY, 20.0),
+                                     .iterations = 20000, .flags = kFlagPerturb}, 360, 413},
+      {"deep_1e100_fx_outline",
+       View{.camera = deep_camera(kMisiurewiczX, kMisiurewiczY, 100.0), .iterations = 5000,
+            .flags = kFlagPerturb | kFlagOutline}, 333, 301},
+      {"julia_1e30_perturb",
+       View{.camera = deep_camera("1.5275031186435346107897464024449153375667459478117",
+                                  "-0.0759121783522878670718141948260463483664221948479",
+                                  30.0),
+            .iterations = 2000, .flags = kFlagJulia | kFlagPerturb,
+            .julia_re = -0.8, .julia_im = 0.156}, 300, 257},
   };
 
   std::mt19937 rng(1234);
   for (const Case &c : cases) {
     std::printf("%s (%ux%u)\n", c.name, c.width, c.height);
-    const PaneRenderer::Request base = request_for(c.view, c.width, c.height);
+    const View start = with_reference(c.view, c.width, c.height);
+    const PaneRenderer::Request base = request_for(start, c.width, c.height);
     const std::vector<uint32_t> expected = harness.reference(base);
 
     // 1. Progressive refinement: budgets far below one frame force many
@@ -262,7 +292,7 @@ int main(int argc, char **argv) {
     {
       PaneRenderer pane(context);
       harness.finish(pane, base, 1e9);
-      View view = c.view;
+      View view = start;
       const int pans[][2] = {{7, 0}, {0, -13}, {-40, 25}, {3, 3}, {-200, -1}, {1, 150}};
       for (const auto &pan : pans) {
         view.camera.pan_pixels(pan[0], pan[1], c.height);
@@ -290,7 +320,7 @@ int main(int argc, char **argv) {
     //    sub-pixel drag (remainder carried) -- final image vs reference.
     {
       PaneRenderer pane(context);
-      View view = c.view;
+      View view = start;
       PaneRenderer::Request r = request_for(view, c.width, c.height);
       std::uniform_int_distribution<int> step(-60, 60), frames(0, 4);
       for (int i = 0; i < 12; ++i) {
@@ -317,6 +347,39 @@ int main(int argc, char **argv) {
       report("composite half-res == image upscaled 2x",
              harness.composite(pane, 2 * c.width, 2 * c.height, 2), upscaled);
     }
+
+    // 5. Waiting for a reference: a view whose reference is not ready
+    //    computes nothing and keeps the old image (pending), then renders
+    //    normally once requested.
+    {
+      PaneRenderer pane(context);
+      harness.finish(pane, base, 1e9);
+      const auto before = pane.shown();
+      View view = start;
+      view.camera.zoom_at(0.3 * c.width, 0.6 * c.height, 1.7, c.width, c.height);
+      view = with_reference(view, c.width, c.height);
+      const PaneRenderer::Request r = request_for(view, c.width, c.height);
+      bool idle = true;
+      for (int i = 0; i < 3; ++i) {
+        pane.wait_for(r, Clock::now());
+        auto encoder = context.device.CreateCommandEncoder();
+        auto pass = encoder.BeginComputePass();
+        idle = idle && pane.encode(pass, 1e9) == 0.0;
+        pass.End();
+        pane.settle(Clock::now());
+        gpu::Future done = submit(context, encoder.Finish());
+        gpu::wait(context, done);
+      }
+      const auto during = pane.shown();
+      const bool kept = during && before && during->buffer.Get() == before->buffer.Get() &&
+                        pane.busy() && idle && during->scale < 1.0f;
+      std::printf("  %-52s %s\n", "waiting: nothing computed, old image resampled",
+                  kept ? "ok" : "FAIL");
+      if (!kept) ++failures;
+      harness.finish(pane, r, 1e9);
+      report("after waiting: zoomed view == reference", harness.shown(pane),
+             harness.reference(r));
+    }
   }
 
   if (timing) {
@@ -325,8 +388,9 @@ int main(int argc, char **argv) {
     // wait (then SDL upload, not counted). New path: both panes + composition
     // in one submission, no readback. Interleaved, best of 15.
     std::printf("\ntiming: split view home + Julia dragon, 1440x1650 panes, full re-render\n");
-    View m{.camera = {.center_x = -0.5}};
-    View j{.camera = {}, .flags = kFlagJulia, .julia_re = -0.8, .julia_im = 0.156};
+    View m{.camera = Camera::at(-0.5, 0.0, 1.0)};
+    View j{.camera = Camera::at(0.0, 0.0, 1.0), .flags = kFlagJulia, .julia_re = -0.8,
+           .julia_im = 0.156};
     PaneRenderer pm(context), pj(context);
     double old_best = 1e30, new_best = 1e30;
     std::vector<uint32_t> host(size_t(1440) * 1650);
@@ -389,10 +453,11 @@ int main(int argc, char **argv) {
 
     // App-style deep-zoom panning: a full render, then a 10 px drag every
     // frame with the app's 12 ms budget and cost calibration.
-    std::printf("\ntiming: deep_1e9 double-single, 1440x1650 pane\n");
-    View view{.camera = {.center_x = kDeepX, .center_y = kDeepY, .zoom = 1e9},
-              .iterations = 4000, .flags = kFlagDouble};
+    std::printf("\ntiming: deep_1e20 perturbation + BLA, 1440x1650 pane\n");
     const uint32_t w = 1440, h = 1650;
+    View view = with_reference(View{.camera = deep_camera(kDeepX, kDeepY, 20.0),
+                                    .iterations = 20000, .flags = kFlagPerturb},
+                               w, h);
     PaneRenderer pane(context);
     PaneRenderer::Request r = request_for(view, w, h);
     auto t0 = Clock::now();

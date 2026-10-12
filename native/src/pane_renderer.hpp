@@ -32,7 +32,9 @@
 
 #include "gpu.hpp"
 
+#include "bigfloat.hpp"
 #include "fractal_shader.hpp"
+#include "perturbation.hpp"
 #include "viewport.hpp"
 
 // Half-open pixel rectangle; empty rectangles are stored as all zeros.
@@ -161,10 +163,11 @@ inline gpu::Future submit(gpu::Context &context, const wgpu::CommandBuffer &comm
 //
 // Contract the rest of the pipeline relies on (keep it when replacing the
 // inside, e.g. with perturbation or interior block filling):
-//   * begin(uniform) is called once per frame before that frame's encode()s;
-//     everything that determines the image must be in the uniform (or in
-//     state keyed by it), because PaneRenderer compares uniforms bytewise to
-//     decide whether an image can be kept or shifted.
+//   * begin(uniform, reference) is called once per frame before that frame's
+//     encode()s; everything that determines the image must be in the uniform
+//     (or in state keyed by it, like the reference orbit: the uniform carries
+//     its id), because PaneRenderer compares uniforms bytewise to decide
+//     whether an image can be kept or shifted.
 //   * encode() writes exactly the pixels of the tile (region x levels) into
 //     `target`, and the value of a pixel depends only on the uniform and its
 //     grid position (local pixel + tile origin) -- not on the tile, the
@@ -184,7 +187,7 @@ public:
     uint32_t level_lo = 0, level_hi = kLevels - 1;
   };
 
-  explicit FractalKernel(gpu::Context &context) : context_(context) {
+  explicit FractalKernel(gpu::Context &context) : context_(context), reference_(context) {
     using namespace detail_pane;
     layout_ = layout(context, {
         buffer_entry(0, wgpu::ShaderStage::Compute, wgpu::BufferBindingType::Storage, 4),
@@ -192,6 +195,10 @@ public:
                      sizeof(ViewportUniform)),
         buffer_entry(2, wgpu::ShaderStage::Compute, wgpu::BufferBindingType::Uniform,
                      sizeof(TileUniform), true),
+        buffer_entry(3, wgpu::ShaderStage::Compute, wgpu::BufferBindingType::ReadOnlyStorage,
+                     sizeof(GpuOrbitPoint)),
+        buffer_entry(4, wgpu::ShaderStage::Compute, wgpu::BufferBindingType::ReadOnlyStorage,
+                     sizeof(GpuBla)),
     });
     pipeline_ = compute_pipeline(context, layout_, module(context, shaders::kFractal, "fractal"));
     view_ = uniform_buffer(context, sizeof(ViewportUniform), "fractal view");
@@ -199,7 +206,16 @@ public:
     context.check();
   }
 
-  void begin(const ViewportUniform &uniform) {
+  // `reference` is required iff the uniform selects perturbation; it is
+  // uploaded unless already resident (queue order keeps work submitted
+  // earlier reading the previous one).
+  void begin(const ViewportUniform &uniform,
+             const std::shared_ptr<const perturbation::Reference> &reference = nullptr) {
+    if (uniform.flags & kFlagPerturb) {
+      if (!reference || reference->id != uniform.reference_id)
+        throw std::logic_error("perturbation uniform without its reference");
+      if (reference_.upload(reference)) groups_.clear(); // buffers reallocated
+    }
     context_.queue.WriteBuffer(view_, 0, &uniform, sizeof(uniform));
     next_slot_ = 0;
   }
@@ -222,10 +238,14 @@ public:
 
   // Rough cost of a pixel of this view relative to a plain f32 one, so the
   // frame budget adapts at once when a view gets much slower (e.g. switching
-  // to double-single) instead of after one overlong frame. Measured frame
-  // times correct the absolute scale; only the jumps matter here.
+  // to perturbation) instead of after one overlong frame. Measured frame
+  // times correct the absolute scale; only the jumps matter here. Ratios
+  // from tools/bench.cpp on M1: perturbation 2.8x direct f32 per iteration,
+  // Fx 4.5x; BLA skips cut deep views ~3.5x (deep_1e20).
   static double relative_cost(const ViewportUniform &uniform) {
-    return (uniform.flags & kFlagDouble) ? 12.0 : 1.0;
+    if (!(uniform.flags & kFlagPerturb)) return 1.0;
+    const double cost = (uniform.flags & kFlagFloatExp) ? 4.5 : 2.8;
+    return (uniform.flags & kFlagBla) ? 0.3 * cost : cost;
   }
 
   // Drops cached state for a buffer that is about to be released.
@@ -265,11 +285,14 @@ private:
                          group(context_, layout_,
                                {group_entry(0, target.buffer, target.bytes),
                                 group_entry(1, view_, sizeof(ViewportUniform)),
-                                group_entry(2, tiles_, sizeof(TileUniform))}));
+                                group_entry(2, tiles_, sizeof(TileUniform)),
+                                group_entry(3, reference_.orbit().buffer, reference_.orbit().bytes),
+                                group_entry(4, reference_.bla().buffer, reference_.bla().bytes)}));
     return groups_.back().second;
   }
 
   gpu::Context &context_;
+  perturbation::ReferenceBuffers reference_;
   wgpu::BindGroupLayout layout_;
   wgpu::ComputePipeline pipeline_;
   wgpu::Buffer view_, tiles_;
@@ -371,10 +394,13 @@ public:
 
   struct Request {
     ViewportUniform uniform;   // the view's pixel grid (see FractalKernel)
+    // The uniform's reference orbit (perturbation only).
+    std::shared_ptr<const perturbation::Reference> reference = nullptr;
     uint32_t width = 0, height = 0;
     int32_t origin_x = 0, origin_y = 0; // grid position of view pixel (0, 0)
     // Actual view geometry, only used to resample previews.
-    double center_x = 0.0, center_y = 0.0, pixel_size = 1.0;
+    BigFloat center_x, center_y;
+    double log2_pixel_size = 0.0;
   };
 
   // How the shown image maps onto the current view: image pixel =
@@ -401,10 +427,8 @@ public:
     request_ = request;
     cost_ = FractalKernel::relative_cost(request.uniform);
     has_request_ = true;
-    if (shift_job_) { // planned but never encoded: its target holds nothing
-      images_[shift_job_->target].has_view = false;
-      shift_job_.reset();
-    }
+    pending_ = false;
+    drop_shift_job();
     const bool shown_current = holds(images_[shown_], request);
     if (shown_current) stale_since_.reset();
     else if (!stale_since_) stale_since_ = now;
@@ -450,9 +474,21 @@ public:
     work_ = target;
   }
 
+  // A view that cannot be computed yet (its reference orbit is still being
+  // computed): the shown image stays on screen, resampled onto `geometry`
+  // (whose uniform is ignored), and nothing is computed until the next
+  // request().
+  void wait_for(const Request &geometry, Clock::time_point now) {
+    request_ = geometry;
+    has_request_ = true;
+    pending_ = true;
+    drop_shift_job();
+    if (!stale_since_) stale_since_ = now;
+  }
+
   // Pixels still to compute for the current request.
   double remaining() const {
-    if (!has_request_) return 0.0;
+    if (!has_request_ || pending_) return 0.0;
     const Image &image = images_[work_];
     const int64_t total = int64_t(image.width) * image.height;
     double pixels = 0.0;
@@ -461,12 +497,12 @@ public:
     return pixels;
   }
 
-  bool busy() const { return remaining() > 0.0 || work_ != shown_; }
+  bool busy() const { return pending_ || remaining() > 0.0 || work_ != shown_; }
 
   // Encodes up to `budget` pixels of work (at least one tile, so slow views
   // still progress) and returns the pixels encoded.
   double encode(wgpu::ComputePassEncoder &pass, double budget) {
-    if (!has_request_) return 0.0;
+    if (!has_request_ || pending_) return 0.0;
     Image &image = images_[work_];
     if (shift_job_) {
       shift_.encode(pass, images_[shift_job_->source].pixels, image.pixels, image.width,
@@ -488,7 +524,7 @@ public:
       while (hi + 1 < kLevels && image.done[hi + 1] == image.done[lo]) ++hi;
       if (double(full.area() - image.done[lo].area()) * fraction(lo, hi) > left) hi = lo;
       const PixelRect piece = next_piece(image.done[lo], full, fraction(lo, hi), left);
-      if (!begun) kernel_.begin(image.view.uniform);
+      if (!begun) kernel_.begin(image.view.uniform, image.view.reference);
       begun = true;
       const FractalKernel::Tile tile{image.view.origin_x, image.view.origin_y, piece,
                                      uint32_t(lo), uint32_t(hi)};
@@ -502,7 +538,7 @@ public:
 
   // Call after encode(): shows the work image once it beats the shown one.
   void settle(Clock::time_point now) {
-    if (work_ == shown_) return;
+    if (work_ == shown_ || pending_) return;
     const Image &work = images_[work_];
     const int level = work.level();
     if (level < 0) return;
@@ -511,8 +547,9 @@ public:
                 (stale_since_ && now - *stale_since_ >= kStaleLimit);
     if (!swap) {
       // Shown pixels are magnified by the zoom since it was rendered.
-      const double magnified = stride(shown.level()) * shown.view.pixel_size /
-                               std::max(request_.pixel_size, 1e-300);
+      const double magnified =
+          stride(shown.level()) *
+          std::exp2(shown.view.log2_pixel_size - request_.log2_pixel_size);
       swap = stride(level) <= magnified * (1.0 + 1e-9);
     }
     if (!swap) return;
@@ -532,11 +569,18 @@ public:
       out.offset_x = float(r.origin_x - v.origin_x);
       out.offset_y = float(r.origin_y - v.origin_y);
     } else {
-      const double scale = r.pixel_size / v.pixel_size;
-      out.scale = float(scale);
-      out.offset_x = float(-0.5 * r.width * scale + (r.center_x - v.center_x) / v.pixel_size +
+      const double scale = std::exp2(r.log2_pixel_size - v.log2_pixel_size);
+      // Centre offset in image pixels, at any zoom depth (clamped far off).
+      const double whole = std::floor(-v.log2_pixel_size);
+      const FloatExp per_pixel =
+          FloatExp::make(std::exp2(-v.log2_pixel_size - whole), int64_t(whole));
+      auto pixels = [&](const BigFloat &a, const BigFloat &b) {
+        return std::clamp((difference(a, b) * per_pixel).to_double(), -1e7, 1e7);
+      };
+      out.scale = float(std::min(scale, 1e7));
+      out.offset_x = float(-0.5 * r.width * scale + pixels(r.center_x, v.center_x) +
                            0.5 * image.width);
-      out.offset_y = float(-0.5 * r.height * scale - (r.center_y - v.center_y) / v.pixel_size +
+      out.offset_y = float(-0.5 * r.height * scale - pixels(r.center_y, v.center_y) +
                            0.5 * image.height);
     }
     return out;
@@ -572,6 +616,13 @@ private:
     int source, target;
     int32_t dx, dy;
   };
+
+  void drop_shift_job() {
+    if (shift_job_) { // planned but never encoded: its target holds nothing
+      images_[shift_job_->target].has_view = false;
+      shift_job_.reset();
+    }
+  }
 
   static bool same_grid(const Image &image, const Request &request) {
     return image.has_view && image.width == request.width &&
@@ -654,6 +705,7 @@ private:
   int shown_ = 0, work_ = 0;
   Request request_{};
   bool has_request_ = false;
+  bool pending_ = false; // see wait_for()
   std::optional<ShiftJob> shift_job_;
   std::optional<Clock::time_point> stale_since_;
   double ns_per_unit_ = 2.0, cost_ = 1.0; // ~ M1, 1440x1650 home view: 3.8 ms
