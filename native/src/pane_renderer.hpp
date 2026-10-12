@@ -123,14 +123,15 @@ inline wgpu::BindGroup group(gpu::Context &context, const wgpu::BindGroupLayout 
 
 inline wgpu::ComputePipeline compute_pipeline(gpu::Context &context,
                                               const wgpu::BindGroupLayout &layout,
-                                              const wgpu::ShaderModule &module) {
+                                              const wgpu::ShaderModule &module,
+                                              const char *entry_point = "main") {
   wgpu::PipelineLayoutDescriptor layout_descriptor{};
   layout_descriptor.bindGroupLayoutCount = 1;
   layout_descriptor.bindGroupLayouts = &layout;
   wgpu::ComputePipelineDescriptor descriptor{};
   descriptor.layout = context.device.CreatePipelineLayout(&layout_descriptor);
   descriptor.compute.module = module;
-  descriptor.compute.entryPoint = "main";
+  descriptor.compute.entryPoint = entry_point;
   return context.device.CreateComputePipeline(&descriptor);
 }
 
@@ -171,8 +172,11 @@ inline gpu::Future submit(gpu::Context &context, const wgpu::CommandBuffer &comm
 //   * encode() writes exactly the pixels of the tile (region x levels) into
 //     `target`, and the value of a pixel depends only on the uniform and its
 //     grid position (local pixel + tile origin) -- not on the tile, the
-//     dispatch order or the image's other contents. Block-filling schemes
-//     that read neighbours must therefore stay inside one tile.
+//     dispatch order or the image's other contents. Block filling reads
+//     only levels known to be complete (below the tile's level_lo) or
+//     computed by the tile itself; where that cannot vouch for a pixel it
+//     computes it, so filled and computed images differ at most where a
+//     sub-pixel filament slips through a ring (see fill_main).
 //   * Several encode()s per frame share one submission; tile parameters go
 //     through a dynamic-offset uniform ring so each dispatch sees its own.
 // ---------------------------------------------------------------------------
@@ -199,10 +203,16 @@ public:
                      sizeof(GpuOrbitPoint)),
         buffer_entry(4, wgpu::ShaderStage::Compute, wgpu::BufferBindingType::ReadOnlyStorage,
                      sizeof(GpuBla)),
+        buffer_entry(5, wgpu::ShaderStage::Compute, wgpu::BufferBindingType::Storage, 4),
     });
-    pipeline_ = compute_pipeline(context, layout_, module(context, shaders::kFractal, "fractal"));
+    const wgpu::ShaderModule shader = module(context, shaders::kFractal, "fractal");
+    pipeline_ = compute_pipeline(context, layout_, shader);
+    ring_pipeline_ = compute_pipeline(context, layout_, shader, "ring_main");
+    cross_pipeline_ = compute_pipeline(context, layout_, shader, "cross_main");
+    fill_pipeline_ = compute_pipeline(context, layout_, shader, "fill_main");
     view_ = uniform_buffer(context, sizeof(ViewportUniform), "fractal view");
     tiles_ = uniform_buffer(context, kTileSlots * kSlotBytes, "fractal tiles");
+    reserve_flags(4096);
     context.check();
   }
 
@@ -220,19 +230,46 @@ public:
     next_slot_ = 0;
   }
 
+  // Interior block filling (see ring_main in the shader) for tiles that
+  // reach level 1 or 2; off: every pixel is computed.
+  bool block_fill = true;
+
   // False when this frame's tile slots are used up.
   bool encode(wgpu::ComputePassEncoder &pass, const gpu::Tensor &target, const Tile &tile) {
     if (tile.rect.empty()) return true;
     if (next_slot_ == kTileSlots) return false;
+    // Fill flags are never cleared: a mark counts only for the generation
+    // that set it (0, the initial contents, is never used).
+    if (++generation_ == 0) ++generation_;
     const TileUniform uniform{tile.origin_x, tile.origin_y, tile.rect.x0, tile.rect.y0,
-                              tile.rect.x1, tile.rect.y1, tile.level_lo, tile.level_hi};
+                              tile.rect.x1, tile.rect.y1, tile.level_lo, tile.level_hi,
+                              generation_};
     const uint32_t offset = next_slot_++ * kSlotBytes;
     context_.queue.WriteBuffer(tiles_, offset, &uniform, sizeof(uniform));
-    const auto [threads_x, threads_y] = threads(tile);
-    pass.SetPipeline(pipeline_);
+    if (!block_fill || tile.level_hi == 0) {
+      const auto [threads_x, threads_y] = threads(tile);
+      pass.SetBindGroup(0, bind_group(target), 1, &offset);
+      pass.SetPipeline(pipeline_);
+      pass.DispatchWorkgroups(detail_pane::ceil_div(threads_x, 16),
+                              detail_pane::ceil_div(threads_y, 16), 1);
+      return true;
+    }
+    // The three fill passes over the lattice of levels <= level_hi (stride
+    // 2 or 1), in blocks of 18 x 18 points, one around the tile's as a
+    // guard band (block_range mirrors first_block / block_count in the
+    // shader). Each pass sees the previous ones' writes (separate
+    // dispatches of a pass are ordered).
+    const auto [blocks_x, blocks_y] = block_count(tile);
+    reserve_flags(size_t(blocks_x) * blocks_y * 2 * 2 * 2);
     pass.SetBindGroup(0, bind_group(target), 1, &offset);
-    pass.DispatchWorkgroups(detail_pane::ceil_div(threads_x, 16),
-                            detail_pane::ceil_div(threads_y, 16), 1);
+    pass.SetPipeline(ring_pipeline_);
+    pass.DispatchWorkgroups(detail_pane::ceil_div(int64_t(blocks_x) * kCoarseRing, kLineGroup),
+                            blocks_y, 1);
+    pass.SetPipeline(cross_pipeline_);
+    pass.DispatchWorkgroups(detail_pane::ceil_div(int64_t(blocks_x) * kCross, kLineGroup),
+                            blocks_y, 1);
+    pass.SetPipeline(fill_pipeline_);
+    pass.DispatchWorkgroups(2 * blocks_x, 2 * blocks_y, 1);
     return true;
   }
 
@@ -273,8 +310,37 @@ private:
   struct TileUniform {
     int32_t origin_x, origin_y, x0, y0, x1, y1;
     uint32_t level_lo, level_hi;
+    uint32_t generation, pad0 = 0, pad1 = 0, pad2 = 0;
   };
-  static_assert(sizeof(TileUniform) == 32, "must match WGSL Tile");
+  static_assert(sizeof(TileUniform) == 48, "must match WGSL Tile");
+
+  // Block filling geometry (fractal_shader.hpp): fill tiles every 9 lattice
+  // points, blocks of 2 x 2 tiles; line passes use 64-wide workgroups.
+  static constexpr int32_t kFine = 9, kCoarse = 2 * kFine;
+  static constexpr int64_t kCoarseRing = 2 * kCoarse - 1, kCross = 2 * kCoarse - 3;
+  static constexpr int64_t kLineGroup = 64;
+
+  static int32_t floor_div(int32_t a, int32_t d) { return a >= 0 ? a / d : (a - (d - 1)) / d; }
+  // Blocks of a filled tile, as first_block() / block_count() in the shader.
+  static std::pair<uint32_t, uint32_t> block_count(const Tile &tile) {
+    const int32_t s = 4 >> tile.level_hi;
+    auto count = [&](int32_t lo, int32_t hi, int32_t origin) {
+      const int32_t first = floor_div(floor_div(lo + origin + s - 1, s), kCoarse) - 1;
+      const int32_t last = floor_div(floor_div(hi - 1 + origin, s), kCoarse) + 1;
+      return uint32_t(last - first + 1);
+    };
+    return {count(tile.rect.x0, tile.rect.x1, tile.origin_x),
+            count(tile.rect.y0, tile.rect.y1, tile.origin_y)};
+  }
+
+  // Grows the flag buffer (two words per fill tile) to `words`.
+  void reserve_flags(size_t words) {
+    if (flags_.buffer && flags_.bytes >= words * 4) return;
+    size_t capacity = flags_.buffer ? flags_.bytes / 4 : 4096;
+    while (capacity < words) capacity *= 2;
+    flags_ = gpu::createTensor(context_, gpu::Shape{capacity}, gpu::kf32);
+    groups_.clear();
+  }
   static constexpr uint32_t kTileSlots = 64, kSlotBytes = 256; // min uniform offset alignment
 
   const wgpu::BindGroup &bind_group(const gpu::Tensor &target) {
@@ -287,16 +353,18 @@ private:
                                 group_entry(1, view_, sizeof(ViewportUniform)),
                                 group_entry(2, tiles_, sizeof(TileUniform)),
                                 group_entry(3, reference_.orbit().buffer, reference_.orbit().bytes),
-                                group_entry(4, reference_.bla().buffer, reference_.bla().bytes)}));
+                                group_entry(4, reference_.bla().buffer, reference_.bla().bytes),
+                                group_entry(5, flags_.buffer, flags_.bytes)}));
     return groups_.back().second;
   }
 
   gpu::Context &context_;
   perturbation::ReferenceBuffers reference_;
   wgpu::BindGroupLayout layout_;
-  wgpu::ComputePipeline pipeline_;
+  wgpu::ComputePipeline pipeline_, ring_pipeline_, cross_pipeline_, fill_pipeline_;
   wgpu::Buffer view_, tiles_;
-  uint32_t next_slot_ = 0;
+  gpu::Tensor flags_;
+  uint32_t next_slot_ = 0, generation_ = 0;
   std::vector<std::pair<wgpu::Buffer, wgpu::BindGroup>> groups_;
 };
 

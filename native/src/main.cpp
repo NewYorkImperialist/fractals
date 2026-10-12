@@ -24,7 +24,9 @@
 //
 // Rendering is incremental (see pane_renderer.hpp): pans shift the last image
 // and compute only the exposed strips, slow views refine coarse to fine in
-// time slices while the previous image stays on screen, resampled.
+// time slices while the previous image stays on screen, resampled. Interior
+// pixels are cut short by an exact periodicity check (direct f32) and by
+// interior block filling (all paths; see fractal_shader.hpp).
 //
 // The window opens split: Mandelbrot on the left, the Julia set for the
 // crosshair point on the right. Each pane has its own camera.

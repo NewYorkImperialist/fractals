@@ -6,7 +6,7 @@
 // Bindings: 0 the pane image, 1 the view uniform, 2 the tile (dynamic offset):
 // which region of the image a dispatch fills and how its pixels sit on the
 // view's pixel grid, 3 and 4 the reference orbit and its BLA table
-// (perturbation only; see perturbation.hpp).
+// (perturbation only; see perturbation.hpp), 5 block-filling scratch flags.
 //
 // Tiles and progressive levels: a pixel's colour depends only on the view
 // uniform and its grid position g = local pixel + tile.origin, so any tiling
@@ -15,6 +15,10 @@
 // refinement levels: 0 = every 4th pixel in x and y, 1 = the rest of every
 // 2nd, 2 = the rest. A dispatch computes the pixels of levels
 // [level_lo, level_hi] inside [rect_min, rect_max).
+//
+// Entry points: `main` computes every pixel of a tile; `ring_main`,
+// `cross_main` and `fill_main` compute a tile with interior block filling
+// (see the comment above ring_main). FractalKernel picks them.
 //
 // Two ways to iterate a pixel:
 //
@@ -96,6 +100,10 @@ struct Tile {
   rect_max: vec2<i32>,
   level_lo: u32,
   level_hi: u32,
+  generation: u32,      // block filling: marks in fill_flags of this tile
+  _pad0: u32,
+  _pad1: u32,
+  _pad2: u32,
 };
 
 // Reference orbit point: plain f32 (f32 mode, e = 0) or Fx. bla_r repeats
@@ -124,6 +132,9 @@ struct Bla {
 @group(0) @binding(2) var<uniform> tile: Tile;
 @group(0) @binding(3) var<storage, read> orbit: array<OrbitPoint>;
 @group(0) @binding(4) var<storage, read> bla: array<Bla>;
+// Block filling scratch: per fill tile, the generation of the tile that last
+// marked it open (see ring_main).
+@group(0) @binding(5) var<storage, read_write> fill_flags: array<atomic<u32>>;
 
 const FLAG_JULIA: u32 = 1u;
 const FLAG_PERTURB: u32 = 2u;
@@ -134,6 +145,7 @@ const FLAG_INTERIOR: u32 = 32u;
 // Large bailout radius (|z| > 16) keeps smooth colouring band-free.
 const BAILOUT_SQ: f32 = 256.0;
 const TAU: f32 = 6.28318530718;
+const PERIOD_BLOCK: u32 = 16u;
 
 // ---------------------------------------------------------------------------
 // Double-single addition (direct path's pixel coordinate): vec2(hi, lo) with
@@ -224,6 +236,59 @@ fn fx_l1_less(a: Fx, r: f32, r_exp: i32) -> bool {
 // dz_0 = 0) for the distance estimate.
 // ---------------------------------------------------------------------------
 
+fn interior() -> vec3<f32> {
+  return vec3<f32>(f32(view.iteration_limit), 0.0, 0.0);
+}
+
+// ---------------------------------------------------------------------------
+// Periodicity check (Brent's cycle detection) for the direct f32 loop. The
+// iteration is a deterministic map on a finite set of floats, so an orbit
+// that never escapes eventually repeats *exactly*: once z equals a saved
+// snapshot bit for bit, every later iterate repeats too and the pixel can
+// never escape. Exact comparison therefore classifies precisely the pixels
+// the full loop would have run to the iteration limit -- no tolerance, no
+// misclassification. In practice attracting cycles collapse onto an exact
+// float cycle within a few dozen iterations of converging. The snapshot is
+// retaken at iterations 16, 32, 64, ... (Brent), so float cycles of any
+// period up to ~i/2 are caught. z must be the loop's entire state (|z|^2 and
+// dz do not feed back into z). The perturbation loops do not use it: their
+// whole state is (orbit segment, index n, dz), which only repeats once the
+// reference itself does, and an exact check on it (measured on the deep
+// bench cases) found no cycles in time and cost 10-45%; block filling
+// covers their interiors instead. A tolerance on z = Z + dz would not be
+// exact.
+//
+// The loop calls it once per block of PERIOD_BLOCK iterations, not every
+// iteration: the block subsequence z_0, z_16, z_32, ... is periodic whenever
+// z is, so detection is only delayed, and the fixed-length inner loop (bailout
+// test only) unrolls well -- measured faster than the original single loop
+// even on pixels that escape.
+// ---------------------------------------------------------------------------
+
+struct Periodicity {
+  saved: vec2<f32>,
+  next_save: u32,
+};
+
+fn periodicity_start() -> Periodicity {
+  // NaN never compares equal, so nothing matches before the first snapshot.
+  let nan = bitcast<f32>(0x7fc00000u | view.zero_bits);
+  return Periodicity(vec2<f32>(nan), 16u);
+}
+
+// Call with the new z and the iteration count; true means z is on an exact
+// cycle and will never escape.
+fn is_periodic(p: ptr<function, Periodicity>, z: vec2<f32>, i: u32) -> bool {
+  if (all(z == (*p).saved)) {
+    return true;
+  }
+  if (i >= (*p).next_save) {
+    (*p).saved = z;
+    (*p).next_save = i * 2u;
+  }
+  return false;
+}
+
 fn derivative_step(z: vec2<f32>, dz: vec2<f32>, dc: f32) -> vec2<f32> {
   return 2.0 * vec2<f32>(z.x * dz.x - z.y * dz.y, z.x * dz.y + z.y * dz.x) +
          vec2<f32>(dc, 0.0);
@@ -231,10 +296,32 @@ fn derivative_step(z: vec2<f32>, dz: vec2<f32>, dc: f32) -> vec2<f32> {
 
 fn escape_single(z0: vec2<f32>, c: vec2<f32>, dz0: vec2<f32>, dc: f32) -> vec3<f32> {
   let outline = (view.flags & FLAG_OUTLINE) != 0u;
+  var cycle = periodicity_start();
   var z = z0;
   var dz = dz0;
   var r2 = dot(z, z);
   var i = 0u;
+  // Whole blocks of PERIOD_BLOCK iterations (only the bailout is tested
+  // inside), the cycle check between blocks, then the tail one at a time.
+  while (i + PERIOD_BLOCK <= view.iteration_limit) {
+    for (var j = 0u; j < PERIOD_BLOCK; j += 1u) {
+      if (outline) {
+        dz = derivative_step(z, dz, dc);
+      }
+      z = vec2<f32>(z.x * z.x - z.y * z.y, 2.0 * z.x * z.y) + c;
+      r2 = dot(z, z);
+      i += 1u;
+      if (r2 > BAILOUT_SQ) {
+        break;
+      }
+    }
+    if (r2 > BAILOUT_SQ) {
+      break;
+    }
+    if (is_periodic(&cycle, z, i)) {
+      return interior();
+    }
+  }
   while (i < view.iteration_limit && r2 <= BAILOUT_SQ) {
     if (outline) {
       dz = derivative_step(z, dz, dc);
@@ -510,13 +597,9 @@ fn tile_pixel(id: vec2<u32>) -> vec2<i32> {
   return p;
 }
 
-@compute @workgroup_size({{workgroupSize}})
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let local = tile_pixel(gid.xy);
-  if (local.x < 0) {
-    return;
-  }
-
+// Escape-time result (iterations, |z|^2, |dz|^2) of the image pixel `local`.
+// Every entry point computes pixels through here.
+fn render(local: vec2<i32>) -> vec3<f32> {
   // Pixel centre -> zoom-1 plane offset (row 0 is the top edge, y_max).
   // Grid positions are small integers, exact in f32.
   let g = vec2<f32>(local + tile.origin);
@@ -532,28 +615,278 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let p = vec2<f32>(px.x, py.x);
   let julia = (view.flags & FLAG_JULIA) != 0u;
 
-  var result: vec3<f32>;
   if ((view.flags & FLAG_PERTURB) != 0u) {
     if (!julia && (view.flags & FLAG_INTERIOR) != 0u && in_mandelbrot_interior(p)) {
-      result = vec3<f32>(f32(view.iteration_limit), 0.0, 0.0);
-    } else {
-      result = perturb_pixel(plane, julia);
+      return interior();
     }
-  } else if (!julia && in_mandelbrot_interior(p)) {
-    result = vec3<f32>(f32(view.iteration_limit), 0.0, 0.0);
-  } else {
-    // Derivative seeds: d/dz for Julia, d/dc for Mandelbrot.
-    let dz0 = select(vec2<f32>(0.0), vec2<f32>(1.0, 0.0), julia);
-    let dc = select(1.0, 0.0, julia);
-    if (julia) {
-      result = escape_single(p, vec2<f32>(view.julia_x, view.julia_y), dz0, dc);
-    } else {
-      result = escape_single(vec2<f32>(0.0), p, dz0, dc);
-    }
+    return perturb_pixel(plane, julia);
   }
+  if (!julia && in_mandelbrot_interior(p)) {
+    return interior();
+  }
+  // Derivative seeds: d/dz for Julia, d/dc for Mandelbrot.
+  let dz0 = select(vec2<f32>(0.0), vec2<f32>(1.0, 0.0), julia);
+  let dc = select(1.0, 0.0, julia);
+  if (julia) {
+    return escape_single(p, vec2<f32>(view.julia_x, view.julia_y), dz0, dc);
+  }
+  return escape_single(vec2<f32>(0.0), p, dz0, dc);
+}
 
+fn store(local: vec2<i32>, result: vec3<f32>) {
   pixels[u32(local.y) * view.width + u32(local.x)] =
       pack4x8unorm(vec4<f32>(shade(result), 1.0));
+}
+
+@compute @workgroup_size({{workgroupSize}})
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let local = tile_pixel(gid.xy);
+  if (local.x < 0) {
+    return;
+  }
+  store(local, render(local));
+}
+
+// ---------------------------------------------------------------------------
+// Interior block filling, for a tile that computes levels up to level_hi >=
+// 1. The passes work on the lattice of those levels (stride 2 or 1), cut
+// into blocks of COARSE x COARSE points aligned on the grid; points of
+// levels below level_lo are already known and only read.
+//
+//   ring_main   computes the coarse lines (each block's top row and left
+//               column; the next blocks' close it).
+//   cross_main  per block: if the block's ring and its four neighbours'
+//               rings (guard band) never escaped, fills the cross that
+//               splits it into four FINE x FINE fill tiles; otherwise
+//               computes the cross.
+//   fill_main   per fill tile, its ring now known: filled if its ring and
+//               its four neighbours' never escaped, otherwise computed.
+//
+// What a pass may read: levels below level_lo are complete over the whole
+// image; the tile's own levels only inside its rectangle, once an earlier
+// pass computed them (passes are separate dispatches, so ordered). A ring
+// point the tile may not read (or off the image) counts as escaping, so
+// filling never depends on pixels outside what is known, and only the
+// tile's own pixels are written. A pixel is therefore computed or filled
+// depending on where tile edges fall, but filled only where its value is
+// interior anyway (below), so the image stays a function of the uniform and
+// the grid position. Coarse blocks keep the computed rings small where the
+// interior converges slowly (parabolic Julia sets, cusps, deep minibrots).
+//
+// Why filling is exact: "does not escape within N iterations" is the set
+// K_N = {p : |f^n(p)| <= R for n <= N}, an intersection of polynomial
+// lemniscates {|P_n(p)| <= R}. By the maximum principle each has a connected
+// complement (a bounded hole would have |P_n| > R inside and = R on its
+// edge), and a union of connected sets that all contain infinity is
+// connected, so K_N has no holes -- for Mandelbrot and for every Julia set,
+// connected or Cantor dust alike. If a closed curve lies in K_N, so does
+// everything it encloses. Perturbation computes the same per-pixel escape
+// test (a function of c alone), so the argument holds for it too. The ring
+// is only sampled, though: an escaping filament thinner than a lattice step
+// can slip between two samples, which is the one way filling can differ
+// from computing every pixel (the guard band makes this rare: see
+// tools/bench.cpp --no-fill). Pixels that pass the cardioid/bulb test or the
+// periodicity check are in the true set, which lies inside K_N.
+//
+// Interior pixels are recognised by colour: shade() returns exact black for
+// them and never for escaping pixels (its cosine channels are a tenth of a
+// turn apart, so one is always >= 0.09, >= 6/255 even dimmed in outline
+// mode).
+// ---------------------------------------------------------------------------
+
+const FINE: i32 = 9;                     // fill tile pitch: ring line + 8 x 8 inside
+const COARSE: i32 = 2 * FINE;            // block pitch: 2 x 2 fill tiles
+const COARSE_RING: i32 = 2 * COARSE - 1; // coarse-line points owned by a block
+const CROSS: i32 = 2 * COARSE - 3;       // cross points of a block
+const LINE_GROUP: i32 = 64;
+const INTERIOR_PIXEL: u32 = 0xff000000u; // pack4x8unorm(vec4(0, 0, 0, 1))
+
+// Lattice the fill passes work on: all levels up to level_hi.
+fn lattice_stride() -> i32 {
+  return 4 >> tile.level_hi;
+}
+
+fn floor_div(a: vec2<i32>, d: i32) -> vec2<i32> {
+  return select((a - (d - 1)) / d, a / d, a >= vec2<i32>(0));
+}
+
+// Lattice coordinates of the tile's first and last points.
+fn lattice_first() -> vec2<i32> {
+  let s = lattice_stride();
+  return floor_div(tile.rect_min + tile.origin + (s - 1), s);
+}
+fn lattice_last() -> vec2<i32> {
+  return floor_div(tile.rect_max - 1 + tile.origin, lattice_stride());
+}
+
+// Blocks the passes cover: the tile's, plus one around (guard band), whose
+// fill tiles have flags.
+fn first_block() -> vec2<i32> {
+  return floor_div(lattice_first(), COARSE) - 1;
+}
+fn block_count() -> vec2<i32> {
+  return floor_div(lattice_last(), COARSE) + 1 - first_block() + 1;
+}
+
+fn in_image(local: vec2<i32>) -> bool {
+  return all(local >= vec2<i32>(0)) && local.x < i32(view.width) && local.y < i32(view.height);
+}
+
+fn in_rect(local: vec2<i32>) -> bool {
+  return all(local >= tile.rect_min) && all(local < tile.rect_max);
+}
+
+fn own_point(g: vec2<i32>) -> bool {
+  return in_rect(g - tile.origin) && grid_level(g) >= tile.level_lo;
+}
+
+// Fill-tile flags: two words per fill tile (ring mark, cross mark), set to
+// the tile's generation when marked, so stale marks of earlier tiles never
+// need clearing.
+fn flag_index(t: vec2<i32>) -> i32 {
+  let base = first_block() * 2;
+  let count = block_count() * 2;
+  let i = t - base;
+  if (any(i < vec2<i32>(0)) || any(i >= count)) {
+    return -1;
+  }
+  return i.y * count.x + i.x;
+}
+
+fn mark(t: vec2<i32>, word: i32) {
+  let i = flag_index(t);
+  if (i >= 0) {
+    atomicStore(&fill_flags[2 * i + word], tile.generation);
+  }
+}
+
+// Whether fill tile t carries a mark in one of the words `first`..`last`.
+// Tiles beyond the flagged range count as `outside`.
+fn marked(t: vec2<i32>, first: i32, last: i32, outside: bool) -> bool {
+  let i = flag_index(t);
+  if (i < 0) {
+    return outside;
+  }
+  var any_mark = false;
+  for (var w = first; w <= last; w += 1) {
+    any_mark = any_mark || atomicLoad(&fill_flags[2 * i + w]) == tile.generation;
+  }
+  return any_mark;
+}
+
+// Marks every fill tile whose ring passes through lattice point p.
+fn mark_tiles_at(p: vec2<i32>, word: i32) {
+  let base = floor_div(p, FINE);
+  let on_line = p - base * FINE == vec2<i32>(0);
+  for (var dy = select(0, -1, on_line.y); dy <= 0; dy += 1) {
+    for (var dx = select(0, -1, on_line.x); dx <= 0; dx += 1) {
+      mark(base + vec2<i32>(dx, dy), word);
+    }
+  }
+}
+
+// A ring point: computed if it is one of the tile's pixels, otherwise read
+// if known (a lower level), otherwise unknown. Unknown, off-image or
+// escaping points mark their fill tiles open.
+fn ring_point(p: vec2<i32>, word: i32) {
+  let g = p * lattice_stride();
+  let local = g - tile.origin;
+  var open = true;
+  if (in_image(local)) {
+    if (own_point(g)) {
+      let result = render(local);
+      store(local, result);
+      open = u32(result.x) < view.iteration_limit;
+    } else if (grid_level(g) < tile.level_lo) {
+      open = pixels[u32(local.y) * view.width + u32(local.x)] != INTERIOR_PIXEL;
+    }
+  }
+  if (open) {
+    mark_tiles_at(p, word);
+  }
+}
+
+// Pass 1: the coarse lines. Invocation n -> block n / COARSE_RING of a row
+// (its top row segment, then its left column), workgroup row = block row.
+@compute @workgroup_size(LINE_GROUP)
+fn ring_main(@builtin(workgroup_id) wg: vec3<u32>,
+             @builtin(local_invocation_index) index: u32) {
+  let n = i32(wg.x) * LINE_GROUP + i32(index);
+  let b = vec2<i32>(n / COARSE_RING, i32(wg.y));
+  if (b.x >= block_count().x) {
+    return;
+  }
+  let k = n % COARSE_RING;
+  let along = select(vec2<i32>(0, k - COARSE + 1), vec2<i32>(k, 0), k < COARSE);
+  ring_point((first_block() + b) * COARSE + along, 0);
+}
+
+// Pass 2: per block, unless the block's four fill tiles and the eight
+// around them are free of ring marks, the cross splitting it is computed
+// (marking open tiles); otherwise it is filled.
+@compute @workgroup_size(LINE_GROUP)
+fn cross_main(@builtin(workgroup_id) wg: vec3<u32>,
+              @builtin(local_invocation_index) index: u32) {
+  let n = i32(wg.x) * LINE_GROUP + i32(index);
+  let b = vec2<i32>(n / CROSS, i32(wg.y));
+  if (b.x >= block_count().x) {
+    return;
+  }
+  let k = n % CROSS;
+  // Middle row: offsets 1 .. COARSE - 1; middle column: the same minus the centre.
+  var along: vec2<i32>;
+  if (k < COARSE - 1) {
+    along = vec2<i32>(k + 1, FINE);
+  } else {
+    let j = k - (COARSE - 1) + 1;
+    along = vec2<i32>(FINE, select(j + 1, j, j < FINE));
+  }
+  let block = first_block() + b;
+  let first = block * 2;
+  var open = false;
+  for (var t = 0; t < 4; t += 1) {
+    let own = first + vec2<i32>(t & 1, t >> 1);
+    let side = select(vec2<i32>(-1, 0), vec2<i32>(1, 0), (t & 1) == 1);
+    let updown = select(vec2<i32>(0, -1), vec2<i32>(0, 1), (t >> 1) == 1);
+    open = open || marked(own, 0, 0, true) || marked(own + side, 0, 0, false) ||
+           marked(own + updown, 0, 0, false);
+  }
+  let p = block * COARSE + along;
+  if (open) {
+    ring_point(p, 1);
+  } else {
+    let g = p * lattice_stride();
+    if (own_point(g)) {
+      store(g - tile.origin, interior());
+    }
+  }
+}
+
+var<workgroup> fill_tile_open: u32;
+
+// Pass 3: one workgroup per fill tile inside (8 x 8 points), computed if the
+// tile or one of its four neighbours is marked, filled otherwise.
+@compute @workgroup_size(FINE - 1, FINE - 1)
+fn fill_main(@builtin(workgroup_id) wg: vec3<u32>,
+             @builtin(local_invocation_id) lid: vec3<u32>) {
+  let t = first_block() * 2 + vec2<i32>(wg.xy);
+  if (all(lid.xy == vec2<u32>(0u))) {
+    fill_tile_open = u32(marked(t, 0, 1, true) ||
+                         marked(t - vec2<i32>(1, 0), 0, 1, false) ||
+                         marked(t + vec2<i32>(1, 0), 0, 1, false) ||
+                         marked(t - vec2<i32>(0, 1), 0, 1, false) ||
+                         marked(t + vec2<i32>(0, 1), 0, 1, false));
+  }
+  let open = workgroupUniformLoad(&fill_tile_open);
+  let g = (t * FINE + 1 + vec2<i32>(lid.xy)) * lattice_stride();
+  if (!own_point(g)) {
+    return;
+  }
+  if (open != 0u) {
+    store(g - tile.origin, render(g - tile.origin));
+  } else {
+    store(g - tile.origin, interior());
+  }
 }
 )WGSL";
 

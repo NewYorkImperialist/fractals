@@ -5,6 +5,7 @@
 //   ./bench --case deep --reps 20         one case, more repetitions
 //   ./bench --mode perturb|direct         force a path (default: as the app)
 //   ./bench --no-bla / --fx               perturbation without BLA / always Fx
+//   ./bench --no-fill                     compute every pixel (no interior block filling)
 //   ./bench --ref-offset 300              reference point 300 px off-centre
 //   ./bench --view RE,IM,ZOOM,ITER[,FLAGS[,JRE,JIM]]   a custom view ("view";
 //                                         FLAGS: 1 Julia, 2 perturbation, 4 outline;
@@ -196,7 +197,7 @@ bool write_png(const std::string &path, const std::vector<uint32_t> &pixels,
 int main(int argc, char **argv) {
   std::string png_dir, only, mode = "auto";
   int reps = 10;
-  bool use_bla = true, force_fx = false;
+  bool use_bla = true, force_fx = false, block_fill = true;
   double ref_offset = 0.0; // move the reference point by this many pixels
   double zoom_log10 = NAN; // override every case's zoom (10^x)
   const char *center_x = nullptr, *center_y = nullptr; // override every case's centre
@@ -210,6 +211,7 @@ int main(int argc, char **argv) {
     else if (arg == "--size" && i + 1 < argc) std::sscanf(argv[++i], "%ux%u", &width, &height);
     else if (arg == "--mode" && i + 1 < argc) mode = argv[++i];
     else if (arg == "--no-bla") use_bla = false;
+    else if (arg == "--no-fill") block_fill = false;
     else if (arg == "--fx") force_fx = true;
     else if (arg == "--ref-offset" && i + 1 < argc) ref_offset = std::atof(argv[++i]);
     else if (arg == "--zoom" && i + 1 < argc) zoom_log10 = std::atof(argv[++i]);
@@ -235,7 +237,7 @@ int main(int argc, char **argv) {
     else {
       std::fprintf(stderr,
                    "usage: bench [--case NAME] [--reps N] [--size WxH] [--png DIR]\n"
-                   "             [--mode auto|direct|perturb] [--no-bla] [--fx]\n"
+                   "             [--mode auto|direct|perturb] [--no-bla] [--fx] [--no-fill]\n"
                    "             [--ref-offset PIXELS] [--zoom LOG10] [--center X Y]\n"
                    "             [--view RE,IM,ZOOM,ITER[,FLAGS[,JRE,JIM]]]\n");
       return 2;
@@ -244,11 +246,13 @@ int main(int argc, char **argv) {
 
   gpu::Context context = gpu::createContext();
   FractalKernel fractal(context);
+  fractal.block_fill = block_fill;
   gpu::Tensor framebuffer =
       gpu::createTensor(context, gpu::Shape{size_t(width) * height}, gpu::kf32);
   std::vector<uint32_t> pixels(size_t(width) * height);
 
-  std::printf("%ux%u, best of %d\n", width, height, reps);
+  std::printf("%ux%u, best of %d%s\n", width, height, reps,
+              block_fill ? "" : ", no block fill");
   std::printf("%-16s %10s %10s %10s %10s  %s\n", "case", "compute", "readback", "frame",
               "ref", "path");
   for (const Case &c : cases) {

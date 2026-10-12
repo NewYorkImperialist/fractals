@@ -14,6 +14,9 @@
 //     stays shown, and the view then renders as usual.
 // Perturbation views (to 1e100) run the same checks with one reference
 // orbit computed up front, as the app's ReferenceCache would provide it.
+// Block filling is on throughout (as in the app); interior-heavy views
+// exercise it on every kind of tile, and each view also reports (info) how
+// the filled reference compares with computing every pixel.
 // Exit status is non-zero if any comparison differs.
 
 #include <algorithm>
@@ -102,18 +105,28 @@ std::vector<uint32_t> read_buffer(gpu::Context &context, const wgpu::Buffer &buf
   return out;
 }
 
+// The reference rendered both ways: with block filling (one full-image
+// tile, as bench.cpp) and with every pixel computed. They differ only where
+// an escaping filament slips through a sampled ring (a "fill miss"; see
+// fractal_shader.hpp).
+struct Expected {
+  std::vector<uint32_t> filled, computed;
+};
+
 class Harness {
 public:
   explicit Harness(gpu::Context &context)
       : context_(context), kernel_(context),
         compositor_(context, wgpu::TextureFormat::RGBA8Unorm) {}
 
-  // One full-image dispatch: the reference.
-  std::vector<uint32_t> reference(const PaneRenderer::Request &r) {
+  // One full-image dispatch: the reference (with block filling, as the
+  // renderer, unless `fill` is false).
+  std::vector<uint32_t> reference(const PaneRenderer::Request &r, bool fill = true) {
     if (!scratch_.buffer || scratch_.bytes != size_t(r.width) * r.height * 4)
       scratch_ = gpu::createTensor(context_, gpu::Shape{size_t(r.width) * r.height}, gpu::kf32);
     auto encoder = context_.device.CreateCommandEncoder();
     auto pass = encoder.BeginComputePass();
+    kernel_.block_fill = fill;
     kernel_.begin(r.uniform, r.reference);
     kernel_.encode(pass, scratch_,
                    FractalKernel::Tile{.origin_x = r.origin_x, .origin_y = r.origin_y,
@@ -122,6 +135,10 @@ public:
     gpu::Future done = submit(context_, encoder.Finish());
     gpu::wait(context_, done);
     return read_buffer(context_, scratch_.buffer, size_t(r.width) * r.height);
+  }
+
+  Expected expected(const PaneRenderer::Request &r) {
+    return {reference(r), reference(r, false)};
   }
 
   // One app-style frame; returns the submit-to-done time in ms.
@@ -227,6 +244,29 @@ void report(const char *name, const std::vector<uint32_t> &a, const std::vector<
   if (!ok) ++failures;
 }
 
+// The pipeline fills or computes a pixel depending on where its tiles' edges
+// fall, so each pixel must equal the filled reference -- or, at a fill miss,
+// the computed value. Anything else fails.
+void report(const char *name, const std::vector<uint32_t> &a, const Expected &e) {
+  if (a.size() != e.filled.size()) {
+    report(name, a, e.filled);
+    return;
+  }
+  size_t differ = 0, misses = 0, bad = 0;
+  for (size_t i = 0; i < a.size(); ++i) {
+    misses += e.filled[i] != e.computed[i];
+    if (a[i] == e.filled[i]) continue;
+    ++differ;
+    bad += a[i] != e.computed[i];
+  }
+  if (misses == 0 || bad != 0) {
+    report(name, a, e.filled);
+    return;
+  }
+  std::printf("  %-52s %8zu / %zu pixels differ, all at fill misses (of %zu)\n", name, differ,
+              a.size(), misses);
+}
+
 struct Case {
   const char *name;
   View view;
@@ -268,6 +308,13 @@ int main(int argc, char **argv) {
                                   30.0),
             .iterations = 2000, .flags = kFlagJulia | kFlagPerturb,
             .julia_re = -0.8, .julia_im = 0.156}, 300, 257},
+      // Interior-heavy: block filling does most of the work.
+      {"minibrot_fill", View{.camera = Camera::at(-1.7685, 0.0, 30.0), .iterations = 8000},
+       720, 825},
+      {"julia_cauliflower_fill", View{.camera = Camera::at(0.0, 0.0, 1.0), .iterations = 4000,
+                                      .flags = kFlagJulia, .julia_re = 0.25}, 640, 481},
+      {"deep_cusp_perturb_fill", View{.camera = deep_camera("-1.75", "0", 7.0),
+                                      .iterations = 8000, .flags = kFlagPerturb}, 300, 257},
   };
 
   std::mt19937 rng(1234);
@@ -275,7 +322,9 @@ int main(int argc, char **argv) {
     std::printf("%s (%ux%u)\n", c.name, c.width, c.height);
     const View start = with_reference(c.view, c.width, c.height);
     const PaneRenderer::Request base = request_for(start, c.width, c.height);
-    const std::vector<uint32_t> expected = harness.reference(base);
+    const Expected reference{harness.reference(base), harness.reference(base, false)};
+    const std::vector<uint32_t> &expected = reference.filled;
+    report("  (info) block fill vs every pixel computed", expected, reference.computed, false);
 
     // 1. Progressive refinement: budgets far below one frame force many
     //    tiles on every level; the final image must equal the reference.
@@ -284,7 +333,7 @@ int main(int argc, char **argv) {
       const int frames = harness.finish(pane, base, budget);
       char label[96];
       std::snprintf(label, sizeof(label), "progressive, budget %.0f px (%d frames)", budget, frames);
-      report(label, harness.shown(pane), expected);
+      report(label, harness.shown(pane), reference);
     }
 
     // 2. Pan reuse: integer pans through Camera::pan_pixels, shifted image
@@ -304,7 +353,7 @@ int main(int argc, char **argv) {
         std::snprintf(label, sizeof(label), "pan (%d, %d): computed %.1f%% of pixels, %d frame%s",
                       pan[0], pan[1], 100.0 * work / (double(c.width) * c.height), frames,
                       frames == 1 ? "" : "s");
-        report(label, harness.shown(pane), harness.reference(r));
+        report(label, harness.shown(pane), harness.expected(r));
       }
       // The same final view rendered on a fresh grid (centre = view centre):
       // differs only by f32 rounding of the pixel coordinates.
@@ -332,7 +381,7 @@ int main(int argc, char **argv) {
       r = request_for(view, c.width, c.height);
       harness.finish(pane, r, 5000.0);
       report("random pans mid-refinement + sub-pixel drags", harness.shown(pane),
-             harness.reference(r));
+             harness.expected(r));
     }
 
     // 4. Compositor: presented pixels equal the image, 1x and half-res.
@@ -378,7 +427,7 @@ int main(int argc, char **argv) {
       if (!kept) ++failures;
       harness.finish(pane, r, 1e9);
       report("after waiting: zoomed view == reference", harness.shown(pane),
-             harness.reference(r));
+             harness.expected(r));
     }
   }
 
