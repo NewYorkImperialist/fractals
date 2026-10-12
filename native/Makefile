@@ -5,6 +5,7 @@
 #   make         build ./fractal_explorer
 #   make run
 #   make bench   headless benchmark / reference renderer (tools/bench.cpp)
+#   make test    headless checks of the incremental frame pipeline
 
 GPUCPP     := third_party/gpu.cpp
 GPUCPP_REV := 09bdeaa7a0c6715ed7624ee90eda53aa2d8c4cbc
@@ -15,7 +16,8 @@ CXXFLAGS := -std=c++20 -O3 -Wall -Wextra \
 LDLIBS   := -L$(DAWN)/lib -lwebgpu_dawn -Wl,-rpath,$(abspath $(DAWN)/lib) \
             $(shell sdl2-config --libs)
 
-fractal_explorer: src/main.cpp src/fractal_shader.hpp src/viewport.hpp
+fractal_explorer: src/main.cpp src/fractal_shader.hpp src/viewport.hpp \
+                  src/pane_renderer.hpp
 	@test -f $(DAWN)/include/dawn/webgpu_cpp.h || \
 	  { echo "Dawn is not staged: run 'make deps dawn' first"; exit 1; }
 	$(CXX) $(CXXFLAGS) $< -o $@ $(LDLIBS)
@@ -32,11 +34,19 @@ dawn: $(GPUCPP)
 run: fractal_explorer
 	./fractal_explorer
 
-bench: tools/bench.cpp src/fractal_shader.hpp src/viewport.hpp
+bench: tools/bench.cpp src/fractal_shader.hpp src/viewport.hpp src/pane_renderer.hpp
 	$(CXX) $(CXXFLAGS) $< -o $@ -L$(DAWN)/lib -lwebgpu_dawn \
 	  -Wl,-rpath,$(abspath $(DAWN)/lib) -lz
 
-clean:
-	rm -f fractal_explorer bench
+pipeline_test: tools/pipeline_test.cpp src/fractal_shader.hpp src/viewport.hpp \
+               src/pane_renderer.hpp
+	$(CXX) $(CXXFLAGS) $< -o $@ -L$(DAWN)/lib -lwebgpu_dawn \
+	  -Wl,-rpath,$(abspath $(DAWN)/lib)
 
-.PHONY: deps dawn run clean
+test: pipeline_test
+	./pipeline_test
+
+clean:
+	rm -f fractal_explorer bench pipeline_test
+
+.PHONY: deps dawn run test clean

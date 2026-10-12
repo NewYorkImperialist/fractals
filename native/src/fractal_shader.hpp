@@ -3,8 +3,17 @@
 // WGSL compute shader for the Mandelbrot / Julia explorer.
 //
 // gpu.cpp substitutes {{workgroupSize}} when the gpu::WGSL object is built.
-// Bindings follow gpu.cpp's convention: tensors first (in Bindings{} order),
-// then the kernel's uniform parameter struct at the next binding index.
+// Bindings: 0 the pane image, 1 the view uniform, 2 the tile (dynamic offset):
+// which region of the image a dispatch fills and how its pixels sit on the
+// view's pixel grid.
+//
+// Tiles and progressive levels: a pixel's colour depends only on the view
+// uniform and its grid position g = local pixel + tile.origin, so any tiling
+// of the image, in any order, gives the same image, and an image panned by
+// whole pixels can be shifted instead of recomputed. Grid pixels form three
+// refinement levels: 0 = every 4th pixel in x and y, 1 = the rest of every
+// 2nd, 2 = the rest. A dispatch computes the pixels of levels
+// [level_lo, level_hi] inside [rect_min, rect_max).
 //
 // Precision: WGSL has no f64, so deep zooms use "double-single" arithmetic —
 // each real number is an unevaluated sum hi + lo of two f32s, giving ~48 bits
@@ -46,8 +55,17 @@ struct Viewport {
   _pad: u32,
 };
 
+struct Tile {
+  origin: vec2<i32>,    // grid position of image pixel (0, 0)
+  rect_min: vec2<i32>,  // region, in image pixels
+  rect_max: vec2<i32>,
+  level_lo: u32,
+  level_hi: u32,
+};
+
 @group(0) @binding(0) var<storage, read_write> pixels: array<u32>;
 @group(0) @binding(1) var<uniform> view: Viewport;
+@group(0) @binding(2) var<uniform> tile: Tile;
 
 const FLAG_JULIA: u32 = 1u;
 const FLAG_DOUBLE: u32 = 2u;
@@ -182,14 +200,56 @@ fn shade(result: vec3<f32>) -> vec3<f32> {
   return mix(glow * 0.25, vec3<f32>(1.0), on_set);
 }
 
+fn grid_level(g: vec2<i32>) -> u32 {
+  if ((g.x & 3) == 0 && (g.y & 3) == 0) {
+    return 0u;
+  }
+  if ((g.x & 1) == 0 && (g.y & 1) == 0) {
+    return 1u;
+  }
+  return 2u;
+}
+
+// Invocation -> image pixel of the tile, or (-1, -1) when it has none. Must
+// match tile_threads() on the host. A single level >= 1 is three of every
+// 2s x 2s block (s = its stride), packed three invocations per block so no
+// invocation idles; otherwise invocations step over the stride-s lattice.
+fn tile_pixel(id: vec2<u32>) -> vec2<i32> {
+  let stride = 4 >> tile.level_hi;
+  let packed = tile.level_lo == tile.level_hi && tile.level_lo > 0u;
+  let step = select(stride, 2 * stride, packed);
+  // First lattice point at or before rect_min, on the grid.
+  let g_min = tile.rect_min + tile.origin;
+  let base = g_min - (g_min & vec2<i32>(step - 1)) - tile.origin;
+  var p: vec2<i32>;
+  if (packed) {
+    let corner = base + vec2<i32>(i32(id.x / 3u), i32(id.y)) * step;
+    let sub = id.x % 3u;
+    p = corner + vec2<i32>(select(stride, 0, sub == 1u), select(0, stride, sub != 0u));
+  } else {
+    p = base + vec2<i32>(id.xy) * stride;
+  }
+  if (any(p < tile.rect_min) || any(p >= tile.rect_max)) {
+    return vec2<i32>(-1);
+  }
+  let level = grid_level(p + tile.origin);
+  if (level < tile.level_lo || level > tile.level_hi) {
+    return vec2<i32>(-1);
+  }
+  return p;
+}
+
 @compute @workgroup_size({{workgroupSize}})
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  if (gid.x >= view.width || gid.y >= view.height) {
+  let local = tile_pixel(gid.xy);
+  if (local.x < 0) {
     return;
   }
 
   // Pixel centre -> zoom-1 plane offset (row 0 is the top edge, y_max).
-  let uv = (vec2<f32>(gid.xy) + 0.5) / vec2<f32>(f32(view.width), f32(view.height));
+  // Grid positions are small integers, exact in f32.
+  let g = vec2<f32>(local + tile.origin);
+  let uv = (g + 0.5) / vec2<f32>(f32(view.width), f32(view.height));
   let plane = vec2<f32>(mix(view.x_min, view.x_max, uv.x),
                         mix(view.y_max, view.y_min, uv.y)) / view.zoom;
 
@@ -222,7 +282,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
   }
 
-  pixels[gid.y * view.width + gid.x] = pack4x8unorm(vec4<f32>(shade(result), 1.0));
+  pixels[u32(local.y) * view.width + u32(local.x)] = pack4x8unorm(vec4<f32>(shade(result), 1.0));
 }
 )WGSL";
 

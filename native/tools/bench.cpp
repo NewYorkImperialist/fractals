@@ -5,7 +5,7 @@
 //   ./bench --case deep --reps 20         one case, more repetitions
 //
 // Each case renders one Retina split pane (1440x1650) through the same
-// gpu.cpp kernel the app uses. "compute" is dispatch + wait, "readback" is the
+// FractalKernel the app uses (one full-image tile). "compute" is dispatch + wait, "readback" is the
 // GPU -> CPU copy, "frame" is the app's path (dispatch + readback, one wait).
 // Times are the best of --reps after two warm-up runs, so other GPU work on
 // the machine inflates them less.
@@ -21,7 +21,7 @@
 
 #include "gpu.hpp"
 
-#include "../src/fractal_shader.hpp"
+#include "../src/pane_renderer.hpp"
 #include "../src/viewport.hpp"
 
 namespace {
@@ -138,7 +138,7 @@ int main(int argc, char **argv) {
   }
 
   gpu::Context context = gpu::createContext();
-  gpu::WGSL shader(shaders::kFractal, gpu::Shape{16, 16, 1});
+  FractalKernel fractal(context);
   gpu::Tensor framebuffer =
       gpu::createTensor(context, gpu::Shape{size_t(width) * height}, gpu::kf32);
   std::vector<uint32_t> pixels(size_t(width) * height);
@@ -148,14 +148,20 @@ int main(int argc, char **argv) {
   for (const Case &c : kCases) {
     if (!only.empty() && only != c.name) continue;
     const ViewportUniform uniform = make_uniform(c, width, height);
-    gpu::Kernel kernel = gpu::createKernel(
-        context, shader, gpu::Bindings{gpu::readWrite(framebuffer)},
-        gpu::ceilDiv(gpu::Shape{width, height, 1}, shader.workgroupSize), uniform);
+    const FractalKernel::Tile tile{.rect = {0, 0, int32_t(width), int32_t(height)}};
+    auto dispatch = [&] {
+      auto encoder = context.device.CreateCommandEncoder();
+      auto pass = encoder.BeginComputePass();
+      fractal.begin(uniform);
+      fractal.encode(pass, framebuffer, tile);
+      pass.End();
+      return submit(context, encoder.Finish());
+    };
 
     double compute = 1e30, readback = 1e30, frame = 1e30;
     for (int i = 0; i < reps + 2; ++i) {
       auto t0 = Clock::now();
-      gpu::Future dispatched = gpu::dispatchKernel(context, kernel);
+      gpu::Future dispatched = dispatch();
       gpu::wait(context, dispatched);
       const double tc = elapsed_ms(t0);
 
@@ -165,7 +171,7 @@ int main(int argc, char **argv) {
       const double tr = elapsed_ms(t1);
 
       auto t2 = Clock::now();
-      gpu::Future d2 = gpu::dispatchKernel(context, kernel);
+      gpu::Future d2 = dispatch();
       gpu::Future r2 = gpu::toCPU(context, framebuffer, pixels);
       gpu::wait(context, r2);
       gpu::wait(context, d2);

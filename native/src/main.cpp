@@ -1,5 +1,7 @@
 // Native GPU Mandelbrot / Julia explorer: gpu.cpp (WebGPU via Dawn) compute
-// shader + SDL2 window and input.
+// shader + SDL2 window and input. Frames go straight from the compute shader
+// to a WebGPU surface on the window (no CPU round trip), and only when
+// something changed: when idle the app sleeps waiting for events.
 //
 // Build (macOS / Linux, from the native/ directory, after staging Dawn with
 // third_party/gpu.cpp/tools/build_dawn.sh):
@@ -13,6 +15,10 @@
 //
 // g++ works the same way (g++ 11+ for C++20). Do NOT add -ffast-math: the
 // double -> (hi, lo) split relies on strict IEEE rounding.
+//
+// Rendering is incremental (see pane_renderer.hpp): pans shift the last image
+// and compute only the exposed strips, slow views refine coarse to fine in
+// time slices while the previous image stays on screen, resampled.
 //
 // The window opens split: Mandelbrot on the left, the Julia set for the
 // crosshair point on the right. Each pane has its own camera.
@@ -33,6 +39,11 @@
 
 #define SDL_MAIN_HANDLED
 #include <SDL.h>
+#if defined(__APPLE__)
+#include <SDL_metal.h>
+#elif defined(__linux__)
+#include <SDL_syswm.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -47,57 +58,10 @@
 
 #include "gpu.hpp"
 
-#include "fractal_shader.hpp"
+#include "pane_renderer.hpp"
 #include "viewport.hpp"
 
 namespace {
-
-// ---------------------------------------------------------------------------
-// GPU side: owns the framebuffer tensor and the compute kernel.
-// ---------------------------------------------------------------------------
-
-class FractalRenderer {
-public:
-  explicit FractalRenderer(gpu::Context &context)
-      : context_(context), shader_(shaders::kFractal, gpu::Shape{16, 16, 1}) {
-    shader_.label = "fractal";
-  }
-
-  // Dispatches one frame and reads it back. Pixels are packed RGBA8,
-  // row-major, top row first.
-  const std::vector<uint32_t> &render(const ViewportUniform &uniform) {
-    if (uniform.width != width_ || uniform.height != height_) allocate(uniform);
-    gpu::toGPU(context_, uniform, kernel_);
-    gpu::Future dispatched = gpu::dispatchKernel(context_, kernel_);
-    // The copy is queued behind the dispatch, so waiting on it waits for both.
-    gpu::Future downloaded = gpu::toCPU(context_, framebuffer_, pixels_);
-    gpu::wait(context_, downloaded);
-    gpu::wait(context_, dispatched); // already complete; surfaces any error
-    return pixels_;
-  }
-
-private:
-  void allocate(const ViewportUniform &uniform) {
-    width_ = uniform.width;
-    height_ = uniform.height;
-    const size_t count = size_t(width_) * height_;
-    pixels_.assign(count, 0);
-    // gpu.cpp has no u32 tensor type; kf32 has the same 4-byte element and
-    // the shader declares the buffer as array<u32>.
-    framebuffer_ = gpu::createTensor(context_, gpu::Shape{count}, gpu::kf32);
-    kernel_ = gpu::createKernel(
-        context_, shader_, gpu::Bindings{gpu::readWrite(framebuffer_)},
-        gpu::ceilDiv(gpu::Shape{width_, height_, 1}, shader_.workgroupSize),
-        uniform);
-  }
-
-  gpu::Context &context_;
-  gpu::WGSL shader_;
-  gpu::Tensor framebuffer_;
-  gpu::Kernel kernel_;
-  std::vector<uint32_t> pixels_;
-  uint32_t width_ = 0, height_ = 0;
-};
 
 // ---------------------------------------------------------------------------
 // Explorer state: cameras, layout and render settings.
@@ -144,11 +108,18 @@ struct Explorer {
     return cam.pixel_size(height) < magnitude * 4e-6;
   }
 
-  ViewportUniform uniform(Fractal fractal, uint32_t width, uint32_t height) const {
+  // Uniform for the view's pixel grid (Camera::grid): view pixel (px, py) is
+  // grid pixel (px + origin_x, py + origin_y).
+  ViewportUniform uniform(Fractal fractal, uint32_t width, uint32_t height,
+                          float phase) const {
     const Camera &cam = camera(fractal);
     const Camera::Extent e = Camera::extent(width, height);
-    const DoubleSingle ox(cam.center_x), oy(cam.center_y);
-    const DoubleSingle jx(julia_re), jy(julia_im);
+    const Camera::Grid grid = cam.grid(height);
+    const DoubleSingle ox(grid.x), oy(grid.y);
+    // The Mandelbrot image does not depend on the Julia point; leaving it out
+    // keeps that image valid while the point moves.
+    const bool julia = fractal == Fractal::Julia;
+    const DoubleSingle jx(julia ? julia_re : 0.0), jy(julia ? julia_im : 0.0);
     uint32_t flags = 0;
     if (fractal == Fractal::Julia) flags |= kFlagJulia;
     if (uses_double(fractal, height)) flags |= kFlagDouble;
@@ -164,34 +135,172 @@ struct Explorer {
         .julia_x_hi = jx.hi, .julia_x_lo = jx.lo,
         .julia_y_hi = jy.hi, .julia_y_lo = jy.lo,
         .flags = flags,
-        .color_phase = color_phase,
+        .color_phase = phase,
     };
   }
 };
 
 // ---------------------------------------------------------------------------
-// SDL window / input / presentation.
+// WebGPU surface on the SDL window.
+// ---------------------------------------------------------------------------
+
+class Swapchain {
+public:
+  Swapchain(gpu::Context &context, SDL_Window *window)
+      : context_(context), window_(window) {
+    wgpu::SurfaceDescriptor descriptor{};
+#if defined(__APPLE__)
+    view_ = SDL_Metal_CreateView(window);
+    if (!view_) throw std::runtime_error(SDL_GetError());
+    wgpu::SurfaceSourceMetalLayer metal{};
+    metal.layer = SDL_Metal_GetLayer(view_);
+    descriptor.nextInChain = &metal;
+#elif defined(__linux__)
+    // Untested: Dawn's Vulkan backend on X11 or Wayland.
+    SDL_SysWMinfo info;
+    SDL_VERSION(&info.version);
+    if (!SDL_GetWindowWMInfo(window, &info)) throw std::runtime_error(SDL_GetError());
+#if defined(SDL_VIDEO_DRIVER_X11)
+    wgpu::SurfaceSourceXlibWindow xlib{};
+    if (info.subsystem == SDL_SYSWM_X11) {
+      xlib.display = info.info.x11.display;
+      xlib.window = uint64_t(info.info.x11.window);
+      descriptor.nextInChain = &xlib;
+    }
+#endif
+#if defined(SDL_VIDEO_DRIVER_WAYLAND)
+    wgpu::SurfaceSourceWaylandSurface wayland{};
+    if (info.subsystem == SDL_SYSWM_WAYLAND) {
+      wayland.display = info.info.wl.display;
+      wayland.surface = info.info.wl.surface;
+      descriptor.nextInChain = &wayland;
+    }
+#endif
+    if (!descriptor.nextInChain)
+      throw std::runtime_error("unsupported SDL video driver (need X11 or Wayland)");
+#else
+#error "no WebGPU surface source for this platform"
+#endif
+    surface_ = context.instance.CreateSurface(&descriptor);
+    if (!surface_) throw std::runtime_error("could not create WebGPU surface");
+
+    wgpu::SurfaceCapabilities caps;
+    surface_.GetCapabilities(context.adapter, &caps);
+    if (caps.formatCount == 0) throw std::runtime_error("surface has no formats");
+    // Plain 8-bit UNORM, like the old SDL texture: pixels go out unconverted.
+    format_ = caps.formats[0];
+    for (size_t i = 0; i < caps.formatCount; ++i)
+      if (caps.formats[i] == wgpu::TextureFormat::BGRA8Unorm ||
+          caps.formats[i] == wgpu::TextureFormat::RGBA8Unorm) {
+        format_ = caps.formats[i];
+        break;
+      }
+    // Unlocked frame rate where supported (frames are only drawn on demand).
+    present_mode_ = wgpu::PresentMode::Fifo;
+    for (wgpu::PresentMode preferred :
+         {wgpu::PresentMode::Immediate, wgpu::PresentMode::Mailbox})
+      for (size_t i = 0; i < caps.presentModeCount; ++i)
+        if (caps.presentModes[i] == preferred &&
+            present_mode_ == wgpu::PresentMode::Fifo)
+          present_mode_ = preferred;
+  }
+
+  ~Swapchain() {
+    surface_ = nullptr;
+#if defined(__APPLE__)
+    if (view_) SDL_Metal_DestroyView(view_);
+#endif
+  }
+
+  Swapchain(const Swapchain &) = delete;
+  Swapchain &operator=(const Swapchain &) = delete;
+
+  wgpu::TextureFormat format() const { return format_; }
+  wgpu::PresentMode present_mode() const { return present_mode_; }
+
+  void size_in_pixels(int &width, int &height) const {
+#if defined(__APPLE__)
+    SDL_Metal_GetDrawableSize(window_, &width, &height);
+#else
+    SDL_GetWindowSizeInPixels(window_, &width, &height);
+#endif
+  }
+
+  // The texture to draw this frame into; false if none is available.
+  bool acquire(uint32_t width, uint32_t height, wgpu::Texture &texture) {
+    if (width != width_ || height != height_) configure(width, height);
+    for (int attempt = 0; attempt < 2; ++attempt) {
+      wgpu::SurfaceTexture current;
+      surface_.GetCurrentTexture(&current);
+      switch (current.status) {
+      case wgpu::SurfaceGetCurrentTextureStatus::SuccessOptimal:
+        texture = current.texture;
+        return true;
+      case wgpu::SurfaceGetCurrentTextureStatus::SuccessSuboptimal:
+        texture = current.texture;
+        width_ = 0; // reconfigure next frame
+        return true;
+      case wgpu::SurfaceGetCurrentTextureStatus::Outdated:
+      case wgpu::SurfaceGetCurrentTextureStatus::Lost:
+        configure(width, height);
+        continue;
+      case wgpu::SurfaceGetCurrentTextureStatus::Timeout:
+        return false;
+      default:
+        throw std::runtime_error("could not get the surface texture");
+      }
+    }
+    return false;
+  }
+
+  void present() { surface_.Present(); }
+
+private:
+  void configure(uint32_t width, uint32_t height) {
+    wgpu::SurfaceConfiguration config{};
+    config.device = context_.device;
+    config.format = format_;
+    config.usage = wgpu::TextureUsage::RenderAttachment;
+    config.width = width;
+    config.height = height;
+    config.presentMode = present_mode_;
+    surface_.Configure(&config);
+    width_ = width;
+    height_ = height;
+  }
+
+  gpu::Context &context_;
+  SDL_Window *window_;
+#if defined(__APPLE__)
+  SDL_MetalView view_ = nullptr;
+#endif
+  wgpu::Surface surface_;
+  wgpu::TextureFormat format_ = wgpu::TextureFormat::Undefined;
+  wgpu::PresentMode present_mode_ = wgpu::PresentMode::Fifo;
+  uint32_t width_ = 0, height_ = 0;
+};
+
+// ---------------------------------------------------------------------------
+// SDL window / input / frame loop.
 // ---------------------------------------------------------------------------
 
 struct SdlDeleter {
   void operator()(SDL_Window *w) const { SDL_DestroyWindow(w); }
-  void operator()(SDL_Renderer *r) const { SDL_DestroyRenderer(r); }
-  void operator()(SDL_Texture *t) const { SDL_DestroyTexture(t); }
 };
 template <typename T> using SdlPtr = std::unique_ptr<T, SdlDeleter>;
 
-// One on-screen view: a screen rectangle (output pixels), its GPU kernel and
-// the texture its frames are uploaded to.
+// One on-screen view: a screen rectangle (output pixels) and its renderer.
 struct Pane {
-  Pane(gpu::Context &context, Fractal kind) : kind(kind), gpu(context) {}
+  Pane(gpu::Context &context, Fractal kind) : kind(kind), renderer(context) {}
 
   Fractal kind;
   bool visible = false;
-  SDL_Rect rect{};             // in renderer output pixels
+  SDL_Rect rect{};             // in output pixels
   uint32_t width = 0, height = 0; // render resolution (rect / divisor)
-  FractalRenderer gpu;
-  SdlPtr<SDL_Texture> texture;
-  uint32_t texture_w = 0, texture_h = 0;
+  PaneRenderer renderer;
+  float color_phase = 0.0f;    // phase this pane renders with (see frame())
+  double budget = 0.0;         // pixels it may compute this frame
+  double encoded = 0.0;        // pixels in the frame in flight
 
   bool contains(double x, double y) const {
     return visible && x >= rect.x && x < rect.x + rect.w && y >= rect.y &&
@@ -201,45 +310,47 @@ struct Pane {
 
 class App {
 public:
+  using Clock = std::chrono::steady_clock;
+
   App() {
-    window_.reset(SDL_CreateWindow(
-        "Fractal Explorer", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-        1600, 800, SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI));
+    Uint32 flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI;
+#if defined(__APPLE__)
+    flags |= SDL_WINDOW_METAL;
+#endif
+    window_.reset(SDL_CreateWindow("Fractal Explorer", SDL_WINDOWPOS_CENTERED,
+                                   SDL_WINDOWPOS_CENTERED, 1600, 800, flags));
     if (!window_) throw std::runtime_error(SDL_GetError());
-    // No SDL_RENDERER_PRESENTVSYNC: the frame rate is unlocked.
-    renderer_.reset(SDL_CreateRenderer(window_.get(), -1, SDL_RENDERER_ACCELERATED));
-    if (!renderer_) throw std::runtime_error(SDL_GetError());
+    swapchain_ = std::make_unique<Swapchain>(context_, window_.get());
+    compositor_ = std::make_unique<Compositor>(context_, swapchain_->format());
   }
 
+  // Event driven: sleeps in SDL_WaitEventTimeout while nothing changes, polls while
+  // a frame is on the GPU, and never has more than one frame in flight, so
+  // input is handled while slow views compute in time slices.
   void run() {
-    using Clock = std::chrono::steady_clock;
-    auto last_frame = Clock::now(), last_title = last_frame;
-    int frames = 0;
-
+    last_frame_ = last_title_ = Clock::now();
+    bool idle = false;
     while (running_) {
       SDL_Event event;
+      if (in_flight_) {
+        if (SDL_WaitEventTimeout(&event, 1)) handle(event);
+      } else if (idle) {
+        // Not SDL_WaitEvent: SDL only turns SIGINT/SIGTERM into SDL_QUIT
+        // when it pumps events, so wake up a few times a second.
+        if (SDL_WaitEventTimeout(&event, 250)) handle(event);
+      }
       while (SDL_PollEvent(&event)) handle(event);
 
-      const auto now = Clock::now();
-      const double dt = std::chrono::duration<double>(now - last_frame).count();
-      last_frame = now;
-      if (state_.animate_colors)
-        state_.color_phase = std::fmod(state_.color_phase + float(dt * 0.05), 1.0f);
-
-      if (!layout()) { // minimised
-        SDL_Delay(16);
-        continue;
+      if (in_flight_) {
+        if (!gpu::poll(context_, frame_done_)) continue;
+        finish_frame();
       }
-      draw();
-
-      ++frames;
-      const double since_title = std::chrono::duration<double>(now - last_title).count();
-      if (since_title >= 0.5) {
-        update_title(frames / since_title);
-        frames = 0;
-        last_title = now;
-      }
+      if (!running_) break;
+      const bool was_idle = idle;
+      idle = !frame();
+      if (idle && !was_idle) update_title(true);
     }
+    if (in_flight_) gpu::wait(context_, frame_done_);
   }
 
 private:
@@ -252,8 +363,10 @@ private:
   // Assigns each visible pane its screen rectangle. False when minimised.
   bool layout() {
     int output_w, output_h;
-    SDL_GetRendererOutputSize(renderer_.get(), &output_w, &output_h);
+    swapchain_->size_in_pixels(output_w, output_h);
     if (output_w <= 1 || output_h <= 0) return false;
+    output_w_ = uint32_t(output_w);
+    output_h_ = uint32_t(output_h);
 
     for (Pane &p : panes_) p.visible = false;
     if (state_.split) {
@@ -272,29 +385,122 @@ private:
     return true;
   }
 
-  void draw() {
-    SDL_SetRenderDrawColor(renderer_.get(), 0, 0, 0, 255);
-    SDL_RenderClear(renderer_.get());
+  PaneRenderer::Request request(const Pane &pane) const {
+    const Camera &cam = state_.camera(pane.kind);
+    const Camera::Grid grid = cam.grid(pane.height);
+    return PaneRenderer::Request{
+        .uniform = state_.uniform(pane.kind, pane.width, pane.height, pane.color_phase),
+        .width = pane.width, .height = pane.height,
+        .origin_x = grid.origin_x, .origin_y = grid.origin_y,
+        .center_x = cam.view_x(), .center_y = cam.view_y(),
+        .pixel_size = cam.pixel_size(pane.height),
+    };
+  }
+
+  // Plans, encodes and presents one frame if anything changed. Compute for
+  // all panes and the composition go into one submission. False when there
+  // was nothing to do.
+  bool frame() {
+    const auto now = Clock::now();
+    const double dt =
+        std::min(std::chrono::duration<double>(now - last_frame_).count(), 0.1);
+    last_frame_ = now;
+    if (state_.animate_colors)
+      state_.color_phase = std::fmod(state_.color_phase + float(dt * 0.05), 1.0f);
+
+    if (!layout()) return false; // minimised
+
+    std::vector<Pane *> active;
     for (Pane &pane : panes_) {
       if (!pane.visible) continue;
-      ensure_texture(pane);
-      const auto &pixels =
-          pane.gpu.render(state_.uniform(pane.kind, pane.width, pane.height));
-      SDL_UpdateTexture(pane.texture.get(), nullptr, pixels.data(),
-                        int(pane.width * sizeof(uint32_t)));
-      SDL_RenderCopy(renderer_.get(), pane.texture.get(), nullptr, &pane.rect);
+      // A new palette phase is picked up once the pane has caught up, so
+      // animation never restarts a slow render that is still refining.
+      if (!pane.renderer.busy()) pane.color_phase = state_.color_phase;
+      pane.renderer.request(request(pane), now);
+      active.push_back(&pane);
     }
+
+    std::vector<PaneRenderer *> renderers;
+    for (Pane *p : active) renderers.push_back(&p->renderer);
+    const std::vector<double> budgets = share_budget(renderers);
+    for (size_t i = 0; i < active.size(); ++i) active[i]->budget = budgets[i];
+
+    wgpu::CommandEncoder encoder = context_.device.CreateCommandEncoder();
+    double encoded = 0.0;
+    {
+      wgpu::ComputePassEncoder pass = encoder.BeginComputePass();
+      for (Pane *p : active) {
+        p->encoded = p->renderer.encode(pass, p->budget);
+        encoded += p->encoded;
+      }
+      pass.End();
+    }
+
+    std::vector<Compositor::Pane> draws;
+    for (Pane *p : active) {
+      p->renderer.settle(now);
+      draws.push_back(draw(*p));
+    }
+    bool changed = force_redraw_ || output_w_ != drawn_w_ || output_h_ != drawn_h_ ||
+                   draws.size() != drawn_.size();
+    for (size_t i = 0; !changed && i < draws.size(); ++i)
+      changed = !Compositor::same(draws[i], drawn_[i]);
+    if (encoded == 0.0 && !changed) return false;
+
+    wgpu::Texture texture;
+    const bool presenting = swapchain_->acquire(output_w_, output_h_, texture);
+    if (presenting)
+      compositor_->encode(encoder, texture.CreateView(), output_w_, output_h_, draws);
+    frame_done_ = submit(context_, encoder.Finish());
+    if (presenting) swapchain_->present();
+    in_flight_ = true;
+    submitted_ = Clock::now();
+
+    force_redraw_ = !presenting;
+    drawn_ = std::move(draws);
+    drawn_w_ = output_w_;
+    drawn_h_ = output_h_;
+    return true;
+  }
+
+  // The frame on the GPU finished: update cost estimates and the title.
+  void finish_frame() {
+    in_flight_ = false;
+    const auto now = Clock::now();
+    last_frame_ms_ = std::chrono::duration<double, std::milli>(now - submitted_).count();
+
+    std::vector<PaneRenderer *> renderers;
+    std::vector<double> encoded;
+    for (Pane &p : panes_) {
+      renderers.push_back(&p.renderer);
+      encoded.push_back(p.encoded);
+    }
+    calibrate(renderers, encoded, last_frame_ms_);
+    for (Pane &p : panes_) p.encoded = 0.0;
+
+    ++frames_;
+    if (std::chrono::duration<double>(now - last_title_).count() >= 0.25)
+      update_title(false);
+  }
+
+  Compositor::Pane draw(const Pane &pane) {
+    Compositor::Pane d;
+    d.x = pane.rect.x;
+    d.y = pane.rect.y;
+    d.w = pane.rect.w;
+    d.h = pane.rect.h;
+    d.divisor = uint32_t(divisor());
+    d.shown = pane.renderer.shown();
     if (state_.split) {
-      draw_julia_marker();
-      const SDL_Rect divider{julia_pane().rect.x - 1, 0, 2, julia_pane().rect.h};
-      SDL_SetRenderDrawColor(renderer_.get(), 20, 20, 20, 255);
-      SDL_RenderFillRect(renderer_.get(), &divider);
+      d.divider_right = pane.kind == Fractal::Mandelbrot;
+      d.divider_left = pane.kind == Fractal::Julia;
+      if (pane.kind == Fractal::Mandelbrot) julia_marker(d);
     }
-    SDL_RenderPresent(renderer_.get());
+    return d;
   }
 
   // Crosshair on the Mandelbrot pane at the Julia constant c.
-  void draw_julia_marker() {
+  void julia_marker(Compositor::Pane &d) {
     Pane &m = mandelbrot_pane();
     double px, py;
     state_.mandelbrot.to_pixel(state_.julia_re, state_.julia_im, m.width,
@@ -302,26 +508,15 @@ private:
     const int x = m.rect.x + int(px * divisor());
     const int y = m.rect.y + int(py * divisor());
     if (!m.contains(x, y)) return;
-    const int r = 14 * int(output_scale() + 0.5);
-    if (state_.follow_mouse)
-      SDL_SetRenderDrawColor(renderer_.get(), 255, 255, 255, 255);
-    else
-      SDL_SetRenderDrawColor(renderer_.get(), 255, 210, 0, 255);
-    for (int o = -1; o <= 1; ++o) { // 3px thick
-      SDL_RenderDrawLine(renderer_.get(), x - r, y + o, x + r, y + o);
-      SDL_RenderDrawLine(renderer_.get(), x + o, y - r, x + o, y + r);
+    d.marker = true;
+    d.marker_x = x;
+    d.marker_y = y;
+    d.marker_radius = 14 * int(output_scale() + 0.5);
+    if (!state_.follow_mouse) {
+      d.marker_rgb[0] = 255;
+      d.marker_rgb[1] = 210;
+      d.marker_rgb[2] = 0;
     }
-  }
-
-  void ensure_texture(Pane &pane) {
-    if (pane.texture && pane.texture_w == pane.width && pane.texture_h == pane.height)
-      return;
-    pane.texture.reset(SDL_CreateTexture(renderer_.get(), SDL_PIXELFORMAT_RGBA32,
-                                         SDL_TEXTUREACCESS_STREAMING,
-                                         int(pane.width), int(pane.height)));
-    if (!pane.texture) throw std::runtime_error(SDL_GetError());
-    pane.texture_w = pane.width;
-    pane.texture_h = pane.height;
   }
 
   // ---- input --------------------------------------------------------------
@@ -329,6 +524,9 @@ private:
   void handle(const SDL_Event &event) {
     switch (event.type) {
     case SDL_QUIT: running_ = false; break;
+    case SDL_WINDOWEVENT:
+      if (event.window.event == SDL_WINDOWEVENT_EXPOSED) force_redraw_ = true;
+      break;
     case SDL_MOUSEWHEEL: {
       double x, y;
       cursor_output(x, y);
@@ -478,11 +676,11 @@ private:
                                  state_.julia_im);
   }
 
-  // Renderer output pixels per window point (2 on Retina displays).
+  // Output pixels per window point (2 on Retina displays).
   double output_scale() const {
     int window_w, window_h, output_w, output_h;
     SDL_GetWindowSize(window_.get(), &window_w, &window_h);
-    SDL_GetRendererOutputSize(renderer_.get(), &output_w, &output_h);
+    swapchain_->size_in_pixels(output_w, output_h);
     return window_w > 0 ? double(output_w) / window_w : 1.0;
   }
 
@@ -506,7 +704,9 @@ private:
     py = (y - pane.rect.y) / divisor();
   }
 
-  void update_title(double fps) {
+  // While drawing: GPU time of the last frame and frames per second; when
+  // idle the last frame's time.
+  void update_title(bool idle) {
     static constexpr const char *kPrecisionNames[] = {"auto", "f32", "double-single"};
     auto precision = [&](Fractal kind) {
       return state_.uses_double(kind, pane(kind).height) ? "ds" : "f32";
@@ -517,7 +717,14 @@ private:
       std::snprintf(buffer, sizeof(buffer), args...);
       title += buffer;
     };
-    append("%.0f fps", fps);
+    const auto now = Clock::now();
+    const double seconds = std::chrono::duration<double>(now - last_title_).count();
+    if (idle)
+      append("idle (last frame %.1f ms)", last_frame_ms_);
+    else
+      append("%.1f ms/frame %.0f fps", last_frame_ms_, frames_ / std::max(seconds, 1e-3));
+    frames_ = 0;
+    last_title_ = now;
     if (mandelbrot_pane().visible)
       append(" | Mandelbrot %.3gx %s", state_.mandelbrot.zoom,
              precision(Fractal::Mandelbrot));
@@ -530,13 +737,19 @@ private:
            kPrecisionNames[int(state_.precision)],
            state_.outline ? " | outline" : "",
            state_.half_resolution ? " | half-res" : "");
+    for (const Pane &p : panes_)
+      if (p.visible && p.renderer.busy()) {
+        append("%s", " | refining");
+        break;
+      }
     SDL_SetWindowTitle(window_.get(), title.c_str());
   }
 
   SdlPtr<SDL_Window> window_;
-  SdlPtr<SDL_Renderer> renderer_;
-
   gpu::Context context_ = gpu::createContext();
+  std::unique_ptr<Swapchain> swapchain_;
+  std::unique_ptr<Compositor> compositor_;
+
   // Indexed by Fractal.
   std::array<Pane, 2> panes_{Pane(context_, Fractal::Mandelbrot),
                              Pane(context_, Fractal::Julia)};
@@ -544,6 +757,17 @@ private:
   bool running_ = true;
   Pane *drag_pane_ = nullptr;
   bool picking_ = false;
+
+  uint32_t output_w_ = 0, output_h_ = 0;
+  bool in_flight_ = false;
+  gpu::Future frame_done_;
+  Clock::time_point submitted_, last_frame_, last_title_;
+  double last_frame_ms_ = 0.0;
+  int frames_ = 0;
+  // What is on screen, to skip frames that would draw the same.
+  std::vector<Compositor::Pane> drawn_;
+  uint32_t drawn_w_ = 0, drawn_h_ = 0;
+  bool force_redraw_ = true;
 };
 
 } // namespace

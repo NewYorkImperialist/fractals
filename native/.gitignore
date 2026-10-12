@@ -1,5 +1,7 @@
 third_party/
+third_party
 fractal_explorer
 bench
+pipeline_test
 bench_out/
 bench_baseline/
